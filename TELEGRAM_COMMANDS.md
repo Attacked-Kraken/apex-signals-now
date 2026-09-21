@@ -1,0 +1,99 @@
+# Telegram commands — cruzbot_instance_2
+
+Source of truth: `BOT_COMMAND_SPECS` / `KNOWN_COMMANDS` in
+`trading_bot/telegram_commands.py`, wired by `TradingApp._wire_telegram_commands()`
+in `main.py`. Listener: authorized `TELEGRAM_CHAT_ID` only, long-poll `getUpdates`,
+exclusive flock `/tmp/cruzbot_tg_{bot_id}.lock` (unchanged). Grok uses official xAI
+API only (`trading_bot/grok_client.py`).
+
+## Parity vs production Instance #2 / cruzbot-v1 `instances/kraken-instance-2`
+
+Production reference downloaded as `/workspace/apex-rebuild/compare/tg_i2.py`
+(~3465 lines). Local rebuild aims for **command surface + formatter parity** with
+paper-safe stubs where live Kraken discovery / fill pull is not ported cleanly.
+
+| Area | Parity |
+|------|--------|
+| Command registry (`BOT_COMMAND_SPECS`) | **Full** — same 39 commands incl. production spellings `weekly_digest_101`, `circuity_breaker_manually` |
+| Formatters / parsers (CB, digest, reset/wipe, universe, C2) | **Ported** from `tg_i2.py` |
+| Confirm gates (~60s) for `/reset_paper` `/wipe_paper` | **Ported** (`OpsState` + formatters) |
+| `/universe all\|allowlist\|off` + `/universe_stocks` | **Ported** parsers/replies; DYNAMIC_ALL discovery refresh is **stubbed** (keeps allowlist symbols) |
+| `/weekly_digest_101` | **Ported** expectancy builder (paper DB); LIVE fill pull optional / empty if no `trades_live.db` |
+| `/circuity_breaker_manually` | **Ported** on/off/status + `CIRCUIT_BREAKER_ENABLED` persist; losses always counted |
+| `/positions` `/history` `/logs` `/ping` `/balance` | **Ported** formatters; history prefers `paper_ledger.db` then paper book closes |
+| Inline keyboards / status Symbols expand | **Not ported** (text-only replies) |
+| Full wipe of all production trading tables | **Ported** best-effort (`wipe_paper_artifacts`) |
+| Live broker order paths behind `/close` etc. | Paper-first; LIVE still gated by `.env` + `--live` + `/confirm_live` |
+
+`cruzbot-v1/instances/kraken-instance-2` was not present on this box; parity notes above
+are vs the production `tg_i2.py` dump for Instance #2.
+
+## Command list
+
+| Command | Description | Handler status |
+|---------|-------------|----------------|
+| `/status` | PAPER/LIVE snapshot | Fully ported (local `format_status_reply`) |
+| `/pause` | Skip new buys | Fully ported |
+| `/resume` | Re-enable new buys | Fully ported |
+| `/pnl` | Day P&L report | Fully ported |
+| `/kill` | Flatten + stop loop | Fully ported |
+| `/mode` | Show/switch PAPER/LIVE | Fully ported (simplified vs prod TTL confirm text) |
+| `/confirm_live` | Confirm LIVE switch | Fully ported |
+| `/set_limit` | Update size caps | Fully ported |
+| `/set_threshold` | Entry threshold 15–95 | Fully ported |
+| `/set_threshold_custom` | Custom entry threshold 15–95 | Fully ported |
+| `/set_spread` | Max bid-ask spread % | Fully ported |
+| `/tod_custom` | TOD gate on/off (locks vs profiles) | Fully ported |
+| `/stop_loss` | SL profile tight/medium/free | Fully ported |
+| `/winning_formula` | Winning formula on/off/status | Fully ported |
+| `/weekly_digest_101` | Weekly digest paper\|live | **Added** — real `build_weekly_expectancy_digest` from `tg_i2` |
+| `/circuity_breaker_manually` | CB auto on/off (counts always) | **Added** — real parse/format/execute from `tg_i2` |
+| `/aggressive` `/medium` `/low` | Trade profiles | Fully ported |
+| `/profile` | Set aggressiveness profile | Fully ported |
+| `/test_trade` | Paper ~$100 BUY | Fully ported (paper-only) |
+| `/reset_paper` | Wipe paper book | **Upgraded** — ~60s confirm + optional cash |
+| `/wipe_paper` | Full paper scratch | **Upgraded** — ~60s confirm + artifact wipe |
+| `/factory_reset` | Alias of `/wipe_paper` | **Upgraded** (same gates) |
+| `/set` | Profile alias | Fully ported (profile subset) |
+| `/ping` | Heartbeat latency | Fully ported (`format_ping_reply`) |
+| `/positions` | Open positions | **Upgraded** — production-style formatter |
+| `/balance` | Cash / equity | **Upgraded** — `format_balance_reply` |
+| `/history` | Last 5 trades | **Upgraded** — ledger + book fallback |
+| `/grok` | Grok sentiment | Fully ported (official xAI only) |
+| `/regime` | Market regime | Fully ported (BTC regime engine) |
+| `/logs` | Tail paper log | **Upgraded** — `read_tail_log_lines` + `redact_secrets` |
+| `/universe` | Crypto universe mode | **Upgraded** — `all\|allowlist\|off` |
+| `/universe_all` | Kraken discovery | Wired; discovery refresh stubbed |
+| `/universe_stocks` | Toggle xStocks | **Upgraded** — on/off/toggle |
+| `/symbols` | List active pairs | **Upgraded** — `format_symbols_reply` |
+| `/close` | Close symbol (fee preview / confirm) | Fully ported |
+| `/clear_positions` | Paper close at BE | Fully ported (paper-only) |
+| `/help` | Command list | Fully ported |
+
+## Operator notes (behaviors)
+
+### `/circuity_breaker_manually [on|off|status]`
+- Bare / `status` → current ON/OFF, consecutive losses, trip hint.
+- `on` / `off` → persists `CIRCUIT_BREAKER_ENABLED` to `.env` + runtime settings / `ops.cb_enabled`.
+- Losses **always counted**; auto-pause only when CB is ON (`RiskManager`).
+
+### `/reset_paper` / `/wipe_paper` / `/factory_reset`
+- Two-step confirm (~60s TTL). Optional cash amount (default `ACCOUNT_EQUITY` / 1600).
+- Paper-only; LIVE refused.
+- `/wipe_paper confirm` also clears paper history DBs + truncates paper log and resets paper expectancy sources used by `/weekly_digest_101`.
+
+### `/universe [all|allowlist|off]` + `/universe_stocks [on|off|toggle]`
+- Production parsers/labels. `all` sets `DYNAMIC_ALL` (discovery refresh stubbed in this rebuild).
+
+### `/weekly_digest_101 [paper|live]`
+- 7-day expectancy digest from local DBs; live uses `trades_live.db` / optional fills.
+
+## Packaging
+
+```bash
+python scripts/package_codebase.py
+# or
+python scripts/package_codebase.py --out /tmp/cruzbot_i2_sanitized.zip
+```
+
+Excludes `.env`, venv, caches, DBs, logs, credential-looking files. Keeps `.env.example`.
