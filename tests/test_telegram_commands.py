@@ -26,6 +26,11 @@ from trading_bot.telegram_commands import (
     parse_universe_stocks_args,
     parse_weekly_digest_args,
     parse_wipe_paper_args,
+    parse_set_spread_args,
+    parse_set_max_spread_alias,
+    format_set_spread_reply,
+    execute_set_spread,
+    SetSpreadError,
     redact_secrets,
     wipe_paper_artifacts,
 )
@@ -329,3 +334,90 @@ def test_wf_tier1_defaults(tmp_path):
     assert settings.tp1_fraction == 0.0
     assert settings.circuit_breaker_enabled is True
     assert "0.80%" in reply or "Tier-1" in reply or "HWM" in reply
+
+
+def test_set_spread_percent_units(tmp_path):
+    """User enters percent units: 0.2 → 0.2% stored as fraction 0.002."""
+    assert parse_set_spread_args(["0.2"]) == 0.2
+    assert parse_set_spread_args(["0.5%"]) == 0.5
+    with pytest.raises(SetSpreadError):
+        parse_set_spread_args([])
+    with pytest.raises(SetSpreadError):
+        parse_set_spread_args(["20"])  # > 5% max
+    assert parse_set_max_spread_alias(["MAX_SPREAD_PCT", "0.2"]) == 0.2
+    settings = SimpleNamespace(max_spread_pct=0.002)
+    env_path = tmp_path / ".env"
+    env_path.write_text("PAPER_TRADING_MODE=true\nMAX_SPREAD_PCT=0.002\n")
+    reply = execute_set_spread(settings, ["0.2"], env_path=env_path)
+    assert settings.max_spread_pct == pytest.approx(0.002)
+    assert "0.2%" in reply
+    assert "MAX_SPREAD_PCT=0.002" in env_path.read_text()
+    assert "0.2%" in format_set_spread_reply(0.2)
+
+
+def test_progress_bar_underwater_and_toward_tp():
+    """Progress = pnl toward TP (floor 2%); underwater clamps to 0% (not raw pnl)."""
+    from trading_bot.telegram_commands import format_status_reply
+    from trading_bot.utils.entry_proximity import make_progress_bar
+
+    assert make_progress_bar(0) == "⬜" * 10
+    assert make_progress_bar(100) == "⬛" * 10
+    assert "⬛" in make_progress_bar(43.5) and "⬜" in make_progress_bar(43.5)
+
+    underwater = format_status_reply(
+        paper_cash=2000,
+        paper_equity=2900,
+        wallet_b4=3000,
+        positions=[
+            {
+                "symbol": "XRP-USD",
+                "qty": 100,
+                "avg_entry_price": 1.50,
+                "mark_price": 1.40,
+                "market_value": 140,
+                "unrealized_pl": -10,
+                "side": "long",
+                "take_profit": 1.50 * 1.0225,
+            }
+        ],
+        paused=False,
+        strategy_mode="volume_sweet_spot",
+        last_tick_age_seconds=1.0,
+        paper=True,
+        symbols=["XRP-USD"],
+        entry_threshold=60,
+        max_spread_pct=0.002,
+        entry_proximity={"score": 43.5, "symbol": "XRP-USD", "price": 1.40},
+    )
+    assert "Entry Proximity: [⬛⬛⬛⬛⬜⬜⬜⬜⬜⬜] 43.5%" in underwater
+    assert "Progress: [⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜] 0.0%" in underwater
+
+    # +1.125% mark vs +2.25% TP → 50% progress
+    mid = format_status_reply(
+        paper_cash=2000,
+        paper_equity=3011,
+        wallet_b4=3000,
+        positions=[
+            {
+                "symbol": "ETH-USD",
+                "qty": 1,
+                "avg_entry_price": 100.0,
+                "mark_price": 101.125,
+                "market_value": 101.125,
+                "unrealized_pl": 1.125,
+                "side": "long",
+                "take_profit": 102.25,
+            }
+        ],
+        paused=False,
+        strategy_mode="volume_sweet_spot",
+        last_tick_age_seconds=0.0,
+        paper=True,
+        symbols=["ETH-USD"],
+        max_notional_per_trade=500,
+        max_total_exposure=3000,
+        entry_threshold=60,
+        max_spread_pct=0.002,
+    )
+    assert "Progress: [⬛⬛⬛⬛⬛⬜⬜⬜⬜⬜] 50.0%" in mid
+    assert "caps=$500/trade $3000 exposure" in mid

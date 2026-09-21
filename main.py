@@ -69,6 +69,9 @@ from trading_bot.telegram_commands import (
     parse_universe_stocks_args,
     parse_weekly_digest_args,
     parse_wipe_paper_args,
+    execute_set_spread,
+    SetSpreadError,
+    parse_set_max_spread_alias,
     read_tail_log_lines,
     recent_trades_from_ledger,
     wipe_paper_artifacts,
@@ -512,24 +515,33 @@ class TradingApp:
             v = float(args[0])
             if not 15 <= v <= 95:
                 return "Threshold must be 15–95"
-            from trading_bot.telegram_commands import apply_runtime_entry_threshold
+            from trading_bot.telegram_commands import apply_runtime_entry_threshold, _persist_env
 
             apply_runtime_entry_threshold(self.settings, v)
+            if ENV_PATH.exists():
+                _persist_env(ENV_PATH, {"ENTRY_THRESHOLD": str(v)})
             return f"Threshold → {v:.0f}%"
 
         async def set_threshold_custom(_c: str, args: List[str]) -> str:
             reply = await set_threshold(_c, args)
             object.__setattr__(self.settings, "entry_threshold_custom_lock", True)
+            if ENV_PATH.exists():
+                from trading_bot.telegram_commands import _persist_env
+                _persist_env(ENV_PATH, {"ENTRY_THRESHOLD_CUSTOM_LOCK": "true"})
             return reply + " (custom lock)"
 
         async def set_spread(_c: str, args: List[str]) -> str:
             if not args:
-                return f"max_spread_pct={self.settings.max_spread_pct}"
-            v = float(args[0])
-            if v > 1:
-                v = v / 100.0
-            object.__setattr__(self.settings, "max_spread_pct", v)
-            return f"Spread cap → {v*100:.2f}%"
+                pct = float(self.settings.max_spread_pct) * 100.0
+                return f"max_spread_pct={pct:g}% (fraction {self.settings.max_spread_pct})"
+            try:
+                return execute_set_spread(
+                    self.settings,
+                    args,
+                    env_path=ENV_PATH if ENV_PATH.exists() else None,
+                )
+            except SetSpreadError as exc:
+                return str(exc)
 
         async def tod_custom(_c: str, args: List[str]) -> str:
             if not args:
@@ -538,6 +550,16 @@ class TradingApp:
             object.__setattr__(self.settings, "tod_gate_enabled", on)
             object.__setattr__(self.settings, "disable_tod_gate", not on)
             object.__setattr__(self.settings, "tod_custom_lock", True)
+            if ENV_PATH.exists():
+                from trading_bot.telegram_commands import _persist_env
+                _persist_env(
+                    ENV_PATH,
+                    {
+                        "TOD_GATE_ENABLED": "true" if on else "false",
+                        "DISABLE_TOD_GATE": "false" if on else "true",
+                        "TOD_CUSTOM_LOCK": "true",
+                    },
+                )
             return f"tod_custom → {'ON' if on else 'OFF'} 🔒"
 
         async def stop_loss(_c: str, args: List[str]) -> str:
@@ -713,7 +735,20 @@ class TradingApp:
         async def set_cmd(_c: str, args: List[str]) -> str:
             if args and args[0].lower() in ("aggressive", "medium", "low"):
                 return await profile_cmd(args[0])
-            return "Usage: /set aggressive|medium|low"
+            # /set MAX_SPREAD_PCT <pct> alias (percent units)
+            if args:
+                key0 = str(args[0]).strip().upper().replace("-", "_").split("=", 1)[0]
+                if key0 in ("MAX_SPREAD_PCT", "SPREAD", "SPREAD_PCT", "MAX_SPREAD"):
+                    try:
+                        return execute_set_spread(
+                            self.settings,
+                            args,
+                            env_path=ENV_PATH if ENV_PATH.exists() else None,
+                            from_alias=True,
+                        )
+                    except SetSpreadError as exc:
+                        return str(exc)
+            return "Usage: /set aggressive|medium|low  OR  /set MAX_SPREAD_PCT <pct>"
 
         async def ping(_c: str, _a: List[str]) -> str:
             import time as _time

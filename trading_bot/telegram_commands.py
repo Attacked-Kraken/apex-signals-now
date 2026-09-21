@@ -175,6 +175,116 @@ def apply_runtime_entry_threshold(settings: Any, value: float) -> None:
     os.environ["ENTRY_THRESHOLD"] = str(value)
 
 
+# Telegram /set_spread: user enters percent (0.5 → 0.5%); Settings/.env store fraction.
+SPREAD_PCT_MIN = 0.01  # 0.01%
+SPREAD_PCT_MAX = 5.0  # 5.0%
+SET_SPREAD_USAGE = (
+    "Usage: /set_spread <pct> (e.g. /set_spread 0.5) — percent units, range "
+    f"{SPREAD_PCT_MIN:g}–{SPREAD_PCT_MAX:g}"
+)
+
+
+class SetSpreadError(ValueError):
+    """Invalid /set_spread arguments — callers must not change state."""
+
+
+def parse_set_spread_args(args: Sequence[str]) -> float:
+    """Parse `/set_spread <pct>` → percent float (0.5 means 0.5%).
+
+    Also accepts a single token like ``0.5%``. Raises SetSpreadError on failure.
+    """
+    if len(args) != 1:
+        raise SetSpreadError(SET_SPREAD_USAGE)
+    raw = str(args[0]).strip().replace(",", "")
+    if raw.endswith("%"):
+        raw = raw[:-1].strip()
+    if not raw:
+        raise SetSpreadError(f"Spread must be a number. {SET_SPREAD_USAGE}")
+    try:
+        pct = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise SetSpreadError(f"Spread must be a number. {SET_SPREAD_USAGE}") from exc
+    if pct != pct:  # NaN
+        raise SetSpreadError(f"Spread must be a number. {SET_SPREAD_USAGE}")
+    if pct < SPREAD_PCT_MIN or pct > SPREAD_PCT_MAX:
+        raise SetSpreadError(
+            f"Spread must be {SPREAD_PCT_MIN:g}–{SPREAD_PCT_MAX:g}% inclusive. "
+            f"Got {pct:g}%. {SET_SPREAD_USAGE}"
+        )
+    return pct
+
+
+def parse_set_max_spread_alias(args: Sequence[str]) -> float:
+    """Parse `/set MAX_SPREAD_PCT 0.5` or `/set MAX_SPREAD_PCT=0.5%` → percent."""
+    if not args:
+        raise SetSpreadError(
+            "Usage: /set MAX_SPREAD_PCT <pct> or /set_spread <pct> "
+            f"(e.g. /set_spread 0.5) — range {SPREAD_PCT_MIN:g}–{SPREAD_PCT_MAX:g}"
+        )
+    tokens: list[str] = []
+    for a in args:
+        s = str(a).strip()
+        if "=" in s:
+            left, right = s.split("=", 1)
+            if left:
+                tokens.append(left)
+            if right:
+                tokens.append(right)
+        else:
+            tokens.append(s)
+    if not tokens:
+        raise SetSpreadError(SET_SPREAD_USAGE)
+    key = tokens[0].strip().upper().replace("-", "_")
+    if key not in ("MAX_SPREAD_PCT", "SPREAD", "SPREAD_PCT", "MAX_SPREAD"):
+        raise SetSpreadError(
+            f"Unknown /set key {tokens[0]!r}. Supported: MAX_SPREAD_PCT "
+            f"(or use /set_spread <pct>)"
+        )
+    if len(tokens) != 2:
+        raise SetSpreadError(
+            "Usage: /set MAX_SPREAD_PCT <pct> (e.g. /set MAX_SPREAD_PCT 0.5 "
+            "or /set MAX_SPREAD_PCT=0.5%)"
+        )
+    return parse_set_spread_args([tokens[1]])
+
+
+def format_set_spread_reply(pct: float) -> str:
+    """Telegram confirmation after successful /set_spread (pct is percent units)."""
+    frac = float(pct) / 100.0
+    frac_s = f"{frac:.10f}".rstrip("0").rstrip(".")
+    return (
+        f"✅ Spread cap updated to {float(pct):g}% "
+        f"(MAX_SPREAD_PCT={frac_s}). "
+        f"Entries wider than {float(pct):g}% mid-spread will be skipped."
+    )
+
+
+def apply_runtime_max_spread_pct(settings: Any, frac: float) -> None:
+    object.__setattr__(settings, "max_spread_pct", float(frac))
+    os.environ["MAX_SPREAD_PCT"] = str(frac)
+
+
+def execute_set_spread(
+    settings: Any,
+    args: Sequence[str],
+    *,
+    env_path: Optional[Path] = None,
+    environ: Optional[MutableMapping[str, str]] = None,
+    from_alias: bool = False,
+) -> str:
+    """Validate percent, persist fraction to .env MAX_SPREAD_PCT, mutate Settings."""
+    pct = parse_set_max_spread_alias(args) if from_alias else parse_set_spread_args(args)
+    frac = float(pct) / 100.0
+    frac_s = f"{frac:.10f}".rstrip("0").rstrip(".")
+    apply_runtime_max_spread_pct(settings, frac)
+    env_map = os.environ if environ is None else environ
+    env_map["MAX_SPREAD_PCT"] = frac_s
+    if env_path:
+        _persist_env(Path(env_path), {"MAX_SPREAD_PCT": frac_s})
+    return format_set_spread_reply(pct)
+
+
+
 def execute_set_stop_loss(
     settings: Any,
     profile: str,
