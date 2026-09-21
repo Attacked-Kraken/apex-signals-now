@@ -22,6 +22,8 @@ class BrokerBase(ABC):
         price: Optional[float] = None,
         order_type: str = "market",
         post_only: bool = False,
+        reason: str = "",
+        peak_upl_pct: Optional[float] = None,
     ) -> OrderResult:
         ...
 

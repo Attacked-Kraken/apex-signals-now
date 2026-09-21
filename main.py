@@ -113,6 +113,28 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+
+
+class _TelegramTokenRedactFilter(logging.Filter):
+    """Strip Telegram bot tokens from log records."""
+
+    _pat = __import__("re").compile(r"(api\.telegram\.org/bot)(\d+:[A-Za-z0-9_-]+)")
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        try:
+            msg = record.getMessage()
+            if "api.telegram.org/bot" in msg:
+                record.msg = self._pat.sub(r"\1[REDACTED]", msg)
+                record.args = ()
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+
+_redact = _TelegramTokenRedactFilter()
+logging.getLogger().addFilter(_redact)
+for _h in logging.getLogger().handlers:
+    _h.addFilter(_redact)
 logger = logging.getLogger("apex.main")
 
 _WF_BEAR_SL_MAX = 0.0125
@@ -418,17 +440,33 @@ class TradingApp:
                                     logger.info("TIME_EXIT_MAKER_WAIT %s", pos.symbol)
 
             if hit:
+                peak_frac = float(self.ops.extra.get(f"peak_upl:{pos.symbol}") or 0.0)
+                peak_upl_pct = peak_frac * 100.0  # ops stores fraction; book stores percent
                 self._pending_maker_time_exits.pop(pos.symbol, None)
                 self.ops.extra.pop(f"peak_upl:{pos.symbol}", None)
                 self.ops.extra.pop(f"profit_runner_notified:{pos.symbol}", None)
-                result = await self.executor.sell(pos.symbol, pos.qty, price=mark, reason=reason)
+                result = await self.executor.sell(
+                    pos.symbol,
+                    pos.qty,
+                    price=mark,
+                    reason=reason,
+                    peak_upl_pct=peak_upl_pct,
+                )
                 won = mark > pos.entry if not short else mark < pos.entry
                 self.risk.record_trade_result(won, paused=self.ops.paused)
                 self.broker.set_consecutive_losses(self.risk.consecutive_losses())
                 if self._wants_quick_scalp():
                     self.smart_memory.record(won)
+                pnl_pct = ((mark - pos.entry) / pos.entry * 100.0) if pos.entry else 0.0
+                if short:
+                    pnl_pct = -pnl_pct
+                notional = abs(float(pos.qty) * float(pos.entry))
+                pnl_usd = notional * (pnl_pct / 100.0)
                 await self.notifier.send(
-                    f"{'✅' if won else '❌'} {reason} {pos.symbol} @ {mark:.4f}"
+                    f"{'✅ WIN' if won else '❌ LOSS'} {reason} {pos.symbol}\n"
+                    f"entry {pos.entry:.4f} → exit {mark:.4f} ({pnl_pct:+.2f}%)\n"
+                    f"PnL ${pnl_usd:+.2f} · qty {pos.qty:.6g}"
+                    + (f" · peak {peak_upl_pct:+.2f}%" if peak_upl_pct else "")
                 )
                 if result:
                     logger.info("Exit %s %s → %s", reason, pos.symbol, result.order_id)
@@ -1090,6 +1128,8 @@ class TradingApp:
                             "qty": float(t.get("qty") or 0),
                             "price": float(t.get("price") or t.get("exit") or 0),
                             "pnl": float(t.get("pnl") or 0),
+                            "reason": t.get("reason") or "",
+                            "peak_upl_pct": t.get("peak_upl_pct"),
                         }
                     )
                 trades = mapped

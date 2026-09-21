@@ -102,6 +102,7 @@ class Executor:
         *,
         price: Optional[float] = None,
         reason: str = "",
+        peak_upl_pct: Optional[float] = None,
     ) -> Optional[OrderResult]:
         blocked = self._live_order_guard()
         if blocked:
@@ -124,7 +125,13 @@ class Executor:
             )
         try:
             result = await self.broker.place_order(
-                symbol, "SELL", qty, price=price, order_type="market"
+                symbol,
+                "SELL",
+                qty,
+                price=price,
+                order_type="market",
+                reason=reason,
+                peak_upl_pct=peak_upl_pct,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("SELL %s failed (no retry): %s", symbol, exc)

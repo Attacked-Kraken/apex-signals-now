@@ -214,10 +214,19 @@ class KrakenBroker(BrokerBase):
         price: Optional[float] = None,
         order_type: str = "market",
         post_only: bool = False,
+        reason: str = "",
+        peak_upl_pct: Optional[float] = None,
     ) -> OrderResult:
         side_u = side.upper()
         if self.paper:
-            return await self._paper_fill(symbol, side_u, qty, price=price)
+            return await self._paper_fill(
+                symbol,
+                side_u,
+                qty,
+                price=price,
+                reason=reason,
+                peak_upl_pct=peak_upl_pct,
+            )
         await self._private_order_blocked("AddOrder")
         raise NotImplementedError("Live AddOrder not enabled in this paper-first skeleton")
 
@@ -228,6 +237,8 @@ class KrakenBroker(BrokerBase):
         qty: float,
         *,
         price: Optional[float] = None,
+        reason: str = "",
+        peak_upl_pct: Optional[float] = None,
     ) -> OrderResult:
         ticker = await self.get_ticker(symbol)
         px = float(price) if price is not None and price > 0 else float(ticker.get("mid") or ticker.get("last") or 0)
@@ -274,6 +285,8 @@ class KrakenBroker(BrokerBase):
             pnl = (px - entry) * sell_qty
             book["cash"] = cash + proceeds
             remaining = pos_qty - sell_qty
+            # peak_upl_pct: percent units (1.25 == +1.25%), converted from ops.extra
+            # fraction peak_upl when provided by the exit path. None if unknown.
             closed = {
                 "symbol": symbol,
                 "qty": sell_qty,
@@ -283,6 +296,10 @@ class KrakenBroker(BrokerBase):
                 "won": pnl > 0,
                 "closed_at": utcnow().isoformat(),
                 "order_id": oid,
+                "reason": reason or "",
+                "peak_upl_pct": (
+                    float(peak_upl_pct) if peak_upl_pct is not None else None
+                ),
             }
             book.setdefault("closed_trades", []).append(closed)
             if remaining <= 1e-12:
@@ -384,7 +401,7 @@ class KrakenBroker(BrokerBase):
             }
         )
 
-    
+
     def paper_wallet_b4(self) -> float:
         """Baseline paper bankroll shown as Wallet B4 on /status."""
         book = self._read_book()
@@ -396,7 +413,7 @@ class KrakenBroker(BrokerBase):
                     pass
         return float(self.account_equity or 0)
 
-def set_consecutive_losses(self, n: int) -> None:
+    def set_consecutive_losses(self, n: int) -> None:
         book = self._read_book()
         book["consecutive_losses"] = int(n)
         self._write_book(book)

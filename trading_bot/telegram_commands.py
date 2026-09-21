@@ -2350,10 +2350,20 @@ def format_history_reply(trades: Sequence[Dict[str, Any]]) -> str:
     for t in trades:
         pnl = float(t.get("pnl") or 0)
         pnl_s = f"-${abs(pnl):.2f}" if pnl < 0 else f"+${pnl:.2f}"
+        reason = str(t.get("reason") or "").strip()
+        peak = t.get("peak_upl_pct")
+        extra = ""
+        if reason:
+            extra += f" {reason}"
+        if peak is not None:
+            try:
+                extra += f" peak={float(peak):+.2f}%"
+            except (TypeError, ValueError):
+                pass
         lines.append(
             f"  {t.get('when','?')} {t.get('side','?')} {t.get('symbol','?')} "
             f"qty={_tg_fmt_qty(float(t.get('qty') or 0))} @ ${_tg_fmt_price(float(t.get('price') or 0))} "
-            f"pnl={pnl_s}"
+            f"pnl={pnl_s}{extra}"
         )
     return "\n".join(lines)
 
