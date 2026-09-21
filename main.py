@@ -264,6 +264,13 @@ class TradingApp:
             # Profit-runner trail: arm at ≥+2.50% UPL or 75% progress; 1% behind peak
             runner_armed = (upl >= _TRAIL_RUNNER_ARM_PCT) or (progress >= _TRAIL_RUNNER_PROGRESS)
             if runner_armed and not short:
+                notify_key = f"profit_runner_notified:{pos.symbol}"
+                if not self.ops.extra.get(notify_key):
+                    self.ops.extra[notify_key] = True
+                    await self.notifier.send(
+                        "🎯 [PROFIT RUNNER] Target >= +2.50% reached. Trailing Stop Activated."
+                    )
+                    logger.info("PROFIT_RUNNER_ARMED %s upl=%.4f progress=%.1f", pos.symbol, upl, progress)
                 trail_sl = mark * (1.0 - _TRAIL_RUNNER_OFFSET_PCT)
                 floor = pos.entry * (1.0 + _HWM_FLOOR_PCT) if peak >= _HWM_PEAK_ARM_PCT else pos.entry * (1.0 + fee_buf)
                 trail_sl = max(trail_sl, floor)
@@ -329,6 +336,8 @@ class TradingApp:
 
             if hit:
                 self._pending_maker_time_exits.pop(pos.symbol, None)
+                self.ops.extra.pop(f"peak_upl:{pos.symbol}", None)
+                self.ops.extra.pop(f"profit_runner_notified:{pos.symbol}", None)
                 result = await self.executor.sell(pos.symbol, pos.qty, price=mark, reason=reason)
                 won = mark > pos.entry if not short else mark < pos.entry
                 self.risk.record_trade_result(won, paused=self.ops.paused)
