@@ -13,3 +13,12 @@ build/
 data/backups_2/
 *.log
 .DS_Store
+
+# runtime data
+*.db
+*.sqlite3
+data/*.db
+data/paper_book_2.json
+data/trade_memory.json
+data/active_params_2.json
+!data/.gitkeep
