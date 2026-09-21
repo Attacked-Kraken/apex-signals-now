@@ -6,11 +6,11 @@ import fcntl
 import logging
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, MutableMapping, Optional, Sequence, Tuple, Union
 
 import httpx
 
@@ -21,7 +21,46 @@ logger = logging.getLogger(__name__)
 
 _CT = ZoneInfo("America/Chicago")
 
-Handler = Callable[[str, List[str]], Awaitable[str]]
+STATUS_SYMBOLS_CALLBACK = "status:symbols"
+STATUS_SYMBOLS_COLLAPSE = "status:symbols_collapse"
+
+
+@dataclass
+class TelegramReply:
+    """Optional rich Telegram reply (inline keyboard / parse_mode)."""
+
+    text: str
+    reply_markup: Optional[Dict[str, Any]] = None
+    parse_mode: Optional[str] = None
+
+
+Handler = Callable[[str, List[str]], Awaitable[Union[str, TelegramReply, None]]]
+CallbackHandler = Callable[[str], Awaitable[Union[str, TelegramReply, None]]]
+
+
+def symbols_expand_keyboard(count: int) -> Dict[str, Any]:
+    """Inline ▼ button under /status — expands the message in place."""
+    n = int(count)
+    label = f"▼ Symbols ({n})" if n else "▼ Symbols"
+    return {"inline_keyboard": [[{"text": label, "callback_data": STATUS_SYMBOLS_CALLBACK}]]}
+
+
+def symbols_collapse_keyboard(count: int) -> Dict[str, Any]:
+    n = int(count)
+    label = f"▲ Hide symbols ({n})" if n else "▲ Hide symbols"
+    return {"inline_keyboard": [[{"text": label, "callback_data": STATUS_SYMBOLS_COLLAPSE}]]}
+
+
+def status_with_symbols_button(text: str, *, symbol_count: int) -> TelegramReply:
+    return TelegramReply(text=text, reply_markup=symbols_expand_keyboard(symbol_count))
+
+
+def _status_compact_body(message_text: str) -> str:
+    text = str(message_text or "")
+    idx = text.find("—— Symbols")
+    if idx >= 0:
+        return text[:idx].rstrip()
+    return text.rstrip()
 
 BOT_COMMAND_SPECS: List[Tuple[str, str]] = [
     ("status", "PAPER/LIVE snapshot"),
@@ -2198,7 +2237,7 @@ def parse_command(text: str) -> Optional[tuple]:
 
 
 class TelegramCommandListener:
-    """Long-poll getUpdates with flock single-poller lock."""
+    """Long-poll getUpdates with flock single-poller lock + inline symbol expand."""
 
     def __init__(
         self,
@@ -2207,10 +2246,12 @@ class TelegramCommandListener:
         handlers: Dict[str, Handler],
         *,
         enabled: bool = True,
+        callback_handlers: Optional[Dict[str, CallbackHandler]] = None,
     ):
         self.token = token or ""
         self.chat_id = str(chat_id or "")
         self.handlers = handlers
+        self.callback_handlers = dict(callback_handlers or {})
         self.enabled = enabled
         self._offset = 0
         self._idle = False
@@ -2275,13 +2316,83 @@ class TelegramCommandListener:
             logger.warning("setMyCommands failed: %s", exc)
 
     async def send_message(self, text: str, chat_id: Optional[str] = None) -> None:
+        await self._send_reply(text, chat_id=chat_id)
+
+    async def _send_reply(
+        self,
+        reply: Union[str, TelegramReply, None],
+        *,
+        chat_id: Optional[str] = None,
+    ) -> None:
         cid = chat_id or self.chat_id
-        if not cid:
+        if not cid or reply is None:
             return
+        if isinstance(reply, TelegramReply):
+            text = reply.text or ""
+            reply_markup = reply.reply_markup
+            parse_mode = reply.parse_mode
+        else:
+            text = str(reply or "")
+            reply_markup = None
+            parse_mode = None
+        if not text and not reply_markup:
+            return
+        # Split long replies so the full symbol list stays scrollable.
+        chunks: List[str] = []
+        body = text or ""
+        while body:
+            chunks.append(body[:3500])
+            body = body[3500:]
+        if not chunks:
+            chunks = [""]
         try:
-            await self._api("sendMessage", chat_id=cid, text=text[:4000])
+            for i, chunk in enumerate(chunks):
+                payload: Dict[str, Any] = {
+                    "chat_id": cid,
+                    "text": (chunk or "(empty)")[:4000],
+                    "disable_web_page_preview": True,
+                }
+                if parse_mode and i == 0:
+                    payload["parse_mode"] = parse_mode
+                # Attach ▼ button only on the first (status) chunk.
+                if reply_markup and i == 0:
+                    payload["reply_markup"] = reply_markup
+                await self._api("sendMessage", **payload)
         except Exception as exc:  # noqa: BLE001
             logger.warning("sendMessage failed: %s", exc)
+
+    async def _answer_callback(self, callback_query_id: str, *, text: str = "") -> None:
+        if not callback_query_id:
+            return
+        try:
+            await self._api(
+                "answerCallbackQuery",
+                callback_query_id=callback_query_id,
+                text=(text or "")[:200],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("answerCallbackQuery failed: %s", exc)
+
+    async def _edit_message(
+        self,
+        *,
+        chat_id: str,
+        message_id: int,
+        text: str,
+        reply_markup: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": int(message_id),
+            "text": (text or "")[:4090],
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        try:
+            await self._api("editMessageText", **payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("editMessageText failed: %s", exc)
 
     def _try_lock(self) -> bool:
         path = self.lock_path
@@ -2314,6 +2425,8 @@ class TelegramCommandListener:
                 await asyncio.sleep(5)
             return
         await self.set_my_commands()
+        # Never log full bot token URLs
+        logging.getLogger("httpx").setLevel(logging.WARNING)
         logger.info("Telegram listener active (lock %s)", self.lock_path)
         while not self._stop.is_set():
             try:
@@ -2334,6 +2447,10 @@ class TelegramCommandListener:
                 await asyncio.sleep(2.0)
 
     async def _dispatch(self, upd: Dict[str, Any]) -> None:
+        cb = upd.get("callback_query")
+        if cb:
+            await self._handle_callback(cb)
+            return
         msg = upd.get("message") or {}
         text = (msg.get("text") or "").strip()
         chat = msg.get("chat") or {}
@@ -2346,11 +2463,11 @@ class TelegramCommandListener:
         cmd = parts[0][1:].split("@", 1)[0].lower()
         args = parts[1:]
         if cmd not in KNOWN_COMMANDS:
-            await self.send_message(f"Unknown command /{cmd}. Try /help", chat_id=cid)
+            await self._send_reply(f"Unknown command /{cmd}. Try /help", chat_id=cid)
             return
         handler = self.handlers.get(cmd)
         if not handler:
-            await self.send_message(f"/{cmd} not wired yet", chat_id=cid)
+            await self._send_reply(f"/{cmd} not wired yet", chat_id=cid)
             return
         try:
             reply = await handler(cmd, args)
@@ -2358,4 +2475,75 @@ class TelegramCommandListener:
             logger.exception("handler /%s", cmd)
             reply = f"Error: {exc}"
         if reply:
-            await self.send_message(str(reply), chat_id=cid)
+            await self._send_reply(reply, chat_id=cid)
+
+    async def _handle_callback(self, cb: Dict[str, Any]) -> None:
+        cq_id = str(cb.get("id") or "")
+        data = str(cb.get("data") or "")
+        msg = cb.get("message") or {}
+        chat = msg.get("chat") or {}
+        chat_id = str(chat.get("id") or "")
+        message_id = msg.get("message_id")
+        if self.chat_id and chat_id != self.chat_id:
+            await self._answer_callback(cq_id, text="Unauthorized")
+            return
+
+        if data in (STATUS_SYMBOLS_CALLBACK, STATUS_SYMBOLS_COLLAPSE) and message_id is not None:
+            compact = _status_compact_body(str(msg.get("text") or ""))
+            n_line = 0
+            for line in compact.splitlines():
+                if line.startswith("Symbols:") and "pairs" in line:
+                    try:
+                        n_line = int(line.split("Symbols:", 1)[1].split("pairs", 1)[0].strip())
+                    except ValueError:
+                        n_line = 0
+                    break
+            if data == STATUS_SYMBOLS_COLLAPSE:
+                await self._answer_callback(cq_id, text="Collapsed")
+                await self._edit_message(
+                    chat_id=chat_id,
+                    message_id=int(message_id),
+                    text=compact,
+                    reply_markup=symbols_expand_keyboard(n_line),
+                )
+                return
+            handler = self.callback_handlers.get(STATUS_SYMBOLS_CALLBACK)
+            if handler is None:
+                await self._answer_callback(cq_id, text="Unknown button")
+                return
+            try:
+                symbols_body = await handler(data)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("telegram callback %s failed", data)
+                await self._answer_callback(cq_id, text="Error")
+                await self._send_reply(f"Button error: {exc}", chat_id=chat_id)
+                return
+            symbols_text = (
+                symbols_body.text if isinstance(symbols_body, TelegramReply) else str(symbols_body or "")
+            )
+            expanded = compact.rstrip() + "\n\n—— Symbols ——\n" + symbols_text.strip()
+            if len(expanded) > 4090:
+                expanded = expanded[:4080] + "\n… (truncated — /symbols)"
+            await self._answer_callback(cq_id, text="Expanded")
+            await self._edit_message(
+                chat_id=chat_id,
+                message_id=int(message_id),
+                text=expanded,
+                reply_markup=symbols_collapse_keyboard(n_line),
+            )
+            return
+
+        handler = self.callback_handlers.get(data)
+        if handler is None:
+            await self._answer_callback(cq_id, text="Unknown button")
+            return
+        try:
+            reply = await handler(data)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("telegram callback %s failed", data)
+            await self._answer_callback(cq_id, text="Error")
+            await self._send_reply(f"Button error: {exc}", chat_id=chat_id)
+            return
+        await self._answer_callback(cq_id, text="OK")
+        if reply:
+            await self._send_reply(reply, chat_id=chat_id)

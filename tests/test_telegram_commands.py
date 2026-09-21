@@ -9,8 +9,14 @@ import pytest
 from trading_bot.telegram_commands import (
     BOT_COMMAND_SPECS,
     KNOWN_COMMANDS,
+    STATUS_SYMBOLS_CALLBACK,
+    STATUS_SYMBOLS_COLLAPSE,
     ResetPaperError,
+    TelegramReply,
     WipePaperError,
+    symbols_collapse_keyboard,
+    symbols_expand_keyboard,
+    status_with_symbols_button,
     build_weekly_expectancy_digest,
     execute_set_circuity_breaker,
     format_circuity_breaker_status,
@@ -249,6 +255,7 @@ def test_format_status_production_substrings():
         "LINK-USD",
         "Progress:",
         "majors_only: ON",
+        "Symbols: 4 pairs · tap ▼ to expand",
     ):
         assert needle in text, needle
 
@@ -421,3 +428,73 @@ def test_progress_bar_underwater_and_toward_tp():
     )
     assert "Progress: [⬛⬛⬛⬛⬛⬜⬜⬜⬜⬜] 50.0%" in mid
     assert "caps=$500/trade $3000 exposure" in mid
+
+
+def test_telegram_reply_and_symbols_keyboards():
+    kb = symbols_expand_keyboard(12)
+    assert kb["inline_keyboard"][0][0]["text"] == "▼ Symbols (12)"
+    assert kb["inline_keyboard"][0][0]["callback_data"] == STATUS_SYMBOLS_CALLBACK
+    hide = symbols_collapse_keyboard(12)
+    assert "▲ Hide symbols (12)" in hide["inline_keyboard"][0][0]["text"]
+    assert hide["inline_keyboard"][0][0]["callback_data"] == STATUS_SYMBOLS_COLLAPSE
+    reply = status_with_symbols_button("hello status", symbol_count=4)
+    assert isinstance(reply, TelegramReply)
+    assert reply.text == "hello status"
+    assert reply.reply_markup == symbols_expand_keyboard(4)
+    empty = status_with_symbols_button("x", symbol_count=0)
+    assert empty.reply_markup["inline_keyboard"][0][0]["text"] == "▼ Symbols"
+
+
+def test_format_status_symbols_tap_line_and_fields():
+    from trading_bot.telegram_commands import format_status_reply
+
+    text = format_status_reply(
+        paper_cash=1493.25,
+        paper_equity=2997.78,
+        wallet_b4=3000.0,
+        positions=[],
+        paused=False,
+        strategy_mode="volume_sweet_spot",
+        last_tick_age_seconds=0.5,
+        paper=True,
+        symbols=["BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD"],
+        max_notional_per_trade=750,
+        max_total_exposure=3000,
+        entry_threshold=60,
+        max_spread_pct=0.002,
+        trade_profile="medium",
+        market_state="BULL_OK",
+        session_wins=1,
+        session_losses=0,
+        win_rate_pct=100.0,
+        symbol_mode="ALLOWLIST",
+        universe_stocks=False,
+        stock_count=0,
+        tod_gate_enabled=False,
+        tod_custom_lock=True,
+        stop_loss_profile="medium",
+        stop_loss_effective_pct=0.015,
+        winning_formula=True,
+        circuit_breaker_on=True,
+        circuit_breaker_consec_losses=0,
+        caps_locked=True,
+        majors_only=True,
+        majors_symbols=["BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD"],
+        entry_proximity={"score": 49.1, "direction": "WAIT", "symbol": "BTC-USD", "price": 81421.30},
+    )
+    for needle in (
+        "Wallet B4",
+        "circuit breaker",
+        "Entry Proximity",
+        "majors_only: ON",
+        "Symbols: 4 pairs · tap ▼ to expand",
+        "stop_loss:",
+        "tod_custom:",
+        "winning_formula: ON",
+        "caps=$750/trade $3000 exposure 🔒",
+        "WR 100%",
+    ):
+        assert needle in text, needle
+    reply = status_with_symbols_button(text, symbol_count=4)
+    assert "▼ Symbols (4)" in reply.reply_markup["inline_keyboard"][0][0]["text"]
+

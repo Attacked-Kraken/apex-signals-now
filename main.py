@@ -33,6 +33,7 @@ from trading_bot.telegram_commands import (
     REPLY_RESET_PAPER_CONFIRM_EXPIRED,
     REPLY_WIPE_PAPER_CONFIRM_EXPIRED,
     RESET_PAPER_CONFIRM_TTL_SECONDS,
+    STATUS_SYMBOLS_CALLBACK,
     STOP_LOSS_PRESETS,
     UNIVERSE_STOCKS_USAGE,
     UNIVERSE_USAGE,
@@ -40,6 +41,7 @@ from trading_bot.telegram_commands import (
     WIPE_PAPER_CONFIRM_TTL_SECONDS,
     ResetPaperError,
     TelegramCommandListener,
+    TelegramReply,
     WipePaperError,
     assert_paper_mode_for_reset_paper,
     assert_paper_mode_for_wipe_paper,
@@ -57,6 +59,7 @@ from trading_bot.telegram_commands import (
     format_reset_paper_done_reply,
     format_reset_paper_pending_reply,
     format_status_reply,
+    status_with_symbols_button,
     format_symbols_reply,
     format_universe_status,
     format_universe_switched,
@@ -439,7 +442,7 @@ class TradingApp:
     # --- Telegram wiring ---
 
     def _wire_telegram_commands(self) -> Dict[str, Any]:
-        async def status(_cmd: str, _args: List[str]) -> str:
+        async def status(_cmd: str, _args: List[str]):
             return await self._cmd_status()
 
         async def pause(_c: str, _a: List[str]) -> str:
@@ -981,7 +984,7 @@ class TradingApp:
             "help": help_cmd,
         }
 
-    async def _cmd_status(self) -> str:
+    async def _cmd_status(self):
         bal = await self.broker.get_balances()
         positions = await self.broker.get_positions()
         thresh, note = self._effective_entry_threshold()
@@ -1033,6 +1036,12 @@ class TradingApp:
             majors = list(MAJORS_ONLY_DEFAULT)
             status_symbols = symbols
 
+        def _is_xstock(sym: str) -> bool:
+            base = str(sym).split("-", 1)[0]
+            return base.endswith("x") or base.endswith("X")
+
+        stock_count = sum(1 for s in symbols if _is_xstock(s))
+
         tod_enabled = bool(self.settings.tod_gate_enabled) and not bool(self.settings.disable_tod_gate)
 
         entry_proximity = {
@@ -1042,7 +1051,12 @@ class TradingApp:
             "direction": "WAIT" if self._short_bias() else ("LONG" if float(self.ops.focus_score or 0) >= thresh else "WAIT"),
         }
 
-        return format_status_reply(
+        # CB banner: ON when enabled (counts always); trip state is consec losses / pause.
+        cb_enabled = bool(getattr(self.settings, "circuit_breaker_enabled", True))
+        if hasattr(self.ops, "cb_enabled"):
+            cb_enabled = bool(getattr(self.ops, "cb_enabled", cb_enabled))
+
+        text = format_status_reply(
             paper_cash=float(bal["cash"]),
             paper_equity=float(bal["equity"]),
             wallet_b4=wallet_b4,
@@ -1069,7 +1083,7 @@ class TradingApp:
             session_losses=losses,
             symbol_mode=self.settings.symbol_mode,
             universe_stocks=bool(self.settings.universe_stocks),
-            stock_count=0,
+            stock_count=stock_count,
             spot_long_only=not bool(self.settings.allow_paper_shorts),
             focus_block_reason=self.ops.focus_blocked or None,
             tod_gate_enabled=tod_enabled,
@@ -1078,12 +1092,24 @@ class TradingApp:
             stop_loss_effective_pct=sl_pct,
             stop_loss_clamped=clamped,
             winning_formula=bool(self.settings.winning_formula),
-            circuit_breaker_on=bool(getattr(self.settings, "circuit_breaker_enabled", True)),
+            circuit_breaker_on=cb_enabled,
             circuit_breaker_consec_losses=int(self.risk.consecutive_losses()),
             caps_locked=bool(getattr(self.settings, "caps_custom_lock", False)),
             majors_only=bool(getattr(self.settings, "majors_only", True)),
             majors_symbols=majors,
         )
+        n = len(list(status_symbols or []))
+        if n > 0:
+            return status_with_symbols_button(text, symbol_count=n)
+        return TelegramReply(text=text)
+
+    def _wire_telegram_callbacks(self) -> Dict[str, Any]:
+        async def status_symbols_expand(_data: str):
+            return format_symbols_reply(
+                self.settings.symbol_list(), mode=self.settings.symbol_mode
+            )
+
+        return {STATUS_SYMBOLS_CALLBACK: status_symbols_expand}
 
     async def start_telegram(self) -> Optional[asyncio.Task]:
         if not self.settings.telegram_commands_enabled:
@@ -1093,6 +1119,7 @@ class TradingApp:
             self.settings.telegram_chat_id,
             self._wire_telegram_commands(),
             enabled=True,
+            callback_handlers=self._wire_telegram_callbacks(),
         )
         self.notifier.telegram = self.tg
         return asyncio.create_task(self.tg.run(), name="telegram")
@@ -1122,7 +1149,8 @@ async def amain(argv: Optional[List[str]] = None) -> int:
         if args.once:
             await app.run_once()
             # print status for smoke
-            print(await app._cmd_status())
+            _st = await app._cmd_status()
+            print(_st.text if isinstance(_st, TelegramReply) else _st)
         else:
             loop_task = asyncio.create_task(app.run_loop(), name="loop")
             await loop_task
