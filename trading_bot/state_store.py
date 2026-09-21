@@ -24,6 +24,7 @@ class OpsState:
     last_scan_ms: Optional[float] = None
     last_scan_n: Optional[int] = None
     last_tick_ts: float = field(default_factory=time.time)
+    rate_limit_cooldown_until: float = 0.0  # epoch seconds (time.time())
     focus_symbol: str = ""
     focus_score: float = 0.0
     focus_blocked: str = ""

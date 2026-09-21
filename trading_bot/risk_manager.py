@@ -53,15 +53,15 @@ class RiskManager:
         open_exposure_usd: float,
         *,
         proposed_notional: Optional[float] = None,
+        available_cash: Optional[float] = None,
     ) -> RiskVerdict:
         max_total = float(self.settings.max_total_exposure_usd)  # fixed; never equity-scaled
+        max_trade = float(self.settings.max_notional_per_trade_usd or 0)
         remaining = max_total - max(0.0, open_exposure_usd)
         proposed = float(
-            proposed_notional
-            if proposed_notional is not None
-            else (self.settings.max_notional_per_trade_usd or 0)
+            proposed_notional if proposed_notional is not None else max_trade
         )
-        if remaining <= 0 or (proposed > 0 and open_exposure_usd + proposed > max_total):
+        if remaining <= 1e-6:
             return RiskVerdict(
                 approved=False,
                 reason=(
@@ -69,8 +69,25 @@ class RiskManager:
                     f"(${max_total:.0f}) — open ${open_exposure_usd:.0f}"
                 ),
             )
-        sized = min(proposed, remaining, float(self.settings.max_notional_per_trade_usd or proposed))
-        return RiskVerdict(approved=True, sized_notional=sized)
+        cash = float(available_cash) if available_cash is not None else None
+        if cash is not None and cash <= 1e-6:
+            return RiskVerdict(
+                approved=False,
+                reason=f"⛔ ENTRY SKIPPED: No cash available (${cash:.2f})",
+            )
+        # Always clamp to per-trade cap + remaining book — never all-in equity
+        sized = min(proposed, remaining, max_trade if max_trade > 0 else proposed)
+        if cash is not None:
+            sized = min(sized, cash)
+        if sized < 10.0:  # dust floor
+            return RiskVerdict(
+                approved=False,
+                reason=(
+                    f"⛔ ENTRY SKIPPED: Sized ${sized:.2f} too small "
+                    f"(cash/exposure room)"
+                ),
+            )
+        return RiskVerdict(approved=True, sized_notional=float(sized))
 
     def check_entry(
         self,
@@ -82,6 +99,7 @@ class RiskManager:
         score: float,
         threshold: float,
         proposed_notional: Optional[float] = None,
+        available_cash: Optional[float] = None,
     ) -> RiskVerdict:
         if paused:
             return RiskVerdict(approved=False, reason="Paused: new buys skipped")
@@ -95,4 +113,8 @@ class RiskManager:
                 approved=False,
                 reason=f"Score {score:.0f} < threshold {threshold:.0f}",
             )
-        return self.check_exposure(open_exposure_usd, proposed_notional=proposed_notional)
+        return self.check_exposure(
+            open_exposure_usd,
+            proposed_notional=proposed_notional,
+            available_cash=available_cash,
+        )

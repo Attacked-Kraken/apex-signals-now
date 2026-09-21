@@ -223,7 +223,7 @@ def test_format_status_production_substrings():
         strategy_mode="volume_sweet_spot",
         last_tick_age_seconds=0.0,
         paper=True,
-        symbols=["BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD"],
+        symbols=["BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD", "XCN-USD"],
         max_notional_per_trade=750,
         max_total_exposure=3000,
         entry_threshold=60,
@@ -242,7 +242,7 @@ def test_format_status_production_substrings():
         circuit_breaker_consec_losses=0,
         caps_locked=True,
         majors_only=True,
-        majors_symbols=["BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD"],
+        majors_symbols=["BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD", "XCN-USD"],
         entry_proximity={"score": 49.1, "direction": "WAIT", "symbol": "BTC-USD", "price": 81421.30},
     )
     for needle in (
@@ -255,7 +255,7 @@ def test_format_status_production_substrings():
         "LINK-USD",
         "Progress:",
         "majors_only: ON",
-        "Symbols: 4 pairs · tap ▼ to expand",
+        "Symbols: 5 pairs · tap ▼ to expand",
     ):
         assert needle in text, needle
 
@@ -457,7 +457,7 @@ def test_format_status_symbols_tap_line_and_fields():
         strategy_mode="volume_sweet_spot",
         last_tick_age_seconds=0.5,
         paper=True,
-        symbols=["BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD"],
+        symbols=["BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD", "XCN-USD"],
         max_notional_per_trade=750,
         max_total_exposure=3000,
         entry_threshold=60,
@@ -479,7 +479,7 @@ def test_format_status_symbols_tap_line_and_fields():
         circuit_breaker_consec_losses=0,
         caps_locked=True,
         majors_only=True,
-        majors_symbols=["BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD"],
+        majors_symbols=["BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD", "XCN-USD"],
         entry_proximity={"score": 49.1, "direction": "WAIT", "symbol": "BTC-USD", "price": 81421.30},
     )
     for needle in (
@@ -487,7 +487,7 @@ def test_format_status_symbols_tap_line_and_fields():
         "circuit breaker",
         "Entry Proximity",
         "majors_only: ON",
-        "Symbols: 4 pairs · tap ▼ to expand",
+        "Symbols: 5 pairs · tap ▼ to expand",
         "stop_loss:",
         "tod_custom:",
         "winning_formula: ON",

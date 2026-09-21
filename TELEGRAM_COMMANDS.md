@@ -14,7 +14,7 @@ paper-safe stubs where live Kraken discovery / fill pull is not ported cleanly.
 
 | Area | Parity |
 |------|--------|
-| Command registry (`BOT_COMMAND_SPECS`) | **Full** — same 39 commands incl. production spellings `weekly_digest_101`, `circuity_breaker_manually` |
+| Command registry (`BOT_COMMAND_SPECS`) | **Full** — same command surface incl. production spellings `weekly_digest_101`, `circuity_breaker_manually` |
 | Formatters / parsers (CB, digest, reset/wipe, universe, C2) | **Ported** from `tg_i2.py` |
 | Confirm gates (~60s) for `/reset_paper` `/wipe_paper` | **Ported** (`OpsState` + formatters) |
 | `/universe all\|allowlist\|off` + `/universe_stocks` | **Ported** parsers/replies; DYNAMIC_ALL discovery refresh is **stubbed** (keeps allowlist symbols) |
@@ -69,6 +69,10 @@ are vs the production `tg_i2.py` dump for Instance #2.
 | `/close` | Close symbol (fee preview / confirm) | Fully ported |
 | `/clear_positions` | Paper close at BE | Fully ported (paper-only) |
 | `/help` | Command list | Fully ported |
+| `/ban_risk` `/api_risk` | API ban-risk hygiene score | Fully ported |
+| `/formula` `/formula_score` | Formula health 0–100 + ranked tips | **Added** — suggest-only (no auto param edits) |
+| `/phd` `/phd_mode` | PHD ops pack + WEAK formula soft entry gate | **Added** — Tier-1 lock; tips not auto-applied |
+| `/quant` `/quant_metrics` | Session risk metrics (DD/Sharpe/Sortino) + PHD DD gate status | **Added** — visibility only; DD gate when phd ON |
 
 ## Operator notes (behaviors)
 
@@ -87,6 +91,21 @@ are vs the production `tg_i2.py` dump for Instance #2.
 
 ### `/weekly_digest_101 [paper|live]`
 - 7-day expectancy digest from local DBs; live uses `trades_live.db` / optional fills.
+
+### `/formula` / `/formula_score`
+- Score 0–100 (higher = healthier). Bands: STRONG ≥70 🟢, OK 45–69 🟡, WEAK <45 🔴.
+- `/status` shows compact `formula: 🟢 78` under `api_risk`.
+- Full report lists component deltas + ranked adjustments with pasteable Telegram actions.
+- Persists rolling history to `data/formula_memory.json` (gitignored). **Never auto-applies** parameter changes.
+
+### `/phd` / `/phd_mode` [on|off|status]
+- ON: forces winning_formula + Profile MEDIUM + stop_loss MEDIUM + circuit_breaker ON + majors_only; soft-blocks **new entries** when formula band is WEAK (exits OK). Does **not** auto-apply `/formula` tip knobs.
+- Also soft-blocks **new entries** when session peak-to-now DD ≥ `PHD_MAX_DD_PCT` (default 8%; exits OK). See `/quant`.
+
+### `/quant` / `/quant_metrics`
+- Session risk health (not alpha proof): DD, peak, equity, Sharpe, Sortino, expectancy, n trades.
+- Shows PHD DD limit and whether the DD gate would fire (gate active only when phd ON).
+- `/status` appends compact `quant: DD … · Sortino … · n=…` when `QUANT_METRICS_ON_STATUS=true` (default).
 
 ## Packaging
 

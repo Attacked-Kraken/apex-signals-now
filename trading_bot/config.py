@@ -63,6 +63,9 @@ class Settings(BaseSettings):
     tod_custom_lock: bool = False
     caps_custom_lock: bool = False
     majors_only: bool = True
+    phd_mode: bool = False
+    phd_max_dd_pct: float = 8.0
+    quant_metrics_on_status: bool = True
     entry_threshold_custom_lock: bool = False
 
     # SL/TP (hot-applied by profiles)
@@ -73,7 +76,20 @@ class Settings(BaseSettings):
     elite_atr_sl_mult: float = 1.5
     max_spread_pct: float = 0.0025
     rvol_breakout_mult: float = 2.0
-    agent_poll_seconds: float = 5.0
+    agent_poll_seconds: float = 1.0
+    # Anti-abuse / API pacing
+    kraken_public_min_interval: float = 0.2
+    ohlc_cache_seconds: float = 8.0
+    ohlc_fetch_concurrency: int = 5
+    rate_limit_trip_after: int = 2
+    rate_limit_cooldown_seconds: float = 120.0
+    agent_poll_jitter_seconds: float = 0.15
+    agent_poll_live_seconds: float = 4.0
+    kraken_public_min_interval_live: float = 0.35
+    ohlc_cache_live_seconds: float = 15.0
+    live_max_orders_per_minute: int = 6
+    api_risk_pause_on_high: bool = True
+    api_risk_pause_on_medium: bool = False
     max_hold_minutes: float = 240.0
     taker_fee_rate: float = 0.008
     maker_fee_rate: float = 0.004

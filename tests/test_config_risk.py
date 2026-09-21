@@ -35,12 +35,26 @@ def test_exposure_cap_fixed():
         _env_file=None,
     )
     rm = RiskManager(s)
-    # 2000 + 1000 == 3000 → allowed (not strictly greater)
+    # 2000 + 1000 == 3000 → allowed (exact fill of remaining)
     v = rm.check_exposure(2000, proposed_notional=1000)
     assert v.approved is True
+    assert abs(v.sized_notional - 1000) < 1e-6
+    # 2500 open → clamp to remaining $500 (not hard-reject while room exists)
     v2 = rm.check_exposure(2500, proposed_notional=1000)
-    assert v2.approved is False
-    assert "Max exposure" in v2.reason
+    assert v2.approved is True
+    assert abs(v2.sized_notional - 500) < 1e-6
+    # Full book → reject
+    v3 = rm.check_exposure(3000, proposed_notional=1000)
+    assert v3.approved is False
+    assert "Max exposure" in v3.reason
+    # No cash → reject
+    v4 = rm.check_exposure(0, proposed_notional=1000, available_cash=0)
+    assert v4.approved is False
+    assert "No cash" in v4.reason
+    # Never exceed per-trade cap even if proposed is huge
+    v5 = rm.check_exposure(0, proposed_notional=5000, available_cash=5000)
+    assert v5.approved is True
+    assert abs(v5.sized_notional - 1000) < 1e-6
 
 
 def test_circuit_breaker_wf():
@@ -119,7 +133,7 @@ def test_status_header_order():
         strategy_mode="volume_sweet_spot",
         last_tick_age_seconds=0.1,
         paper=True,
-        symbols=["BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD"],
+        symbols=["BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD", "XCN-USD"],
         max_notional_per_trade=750.0,
         max_total_exposure=3000.0,
         entry_threshold=60,
@@ -139,10 +153,10 @@ def test_status_header_order():
         circuit_breaker_consec_losses=0,
         caps_locked=True,
         majors_only=True,
-        majors_symbols=["BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD"],
+        majors_symbols=["BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD", "XCN-USD"],
         entry_proximity={"score": 40.0, "direction": "WAIT", "symbol": "BTC-USD", "price": 81348.70},
         last_scan_latency_ms=0,
-        last_scan_pair_count=4,
+        last_scan_pair_count=5,
     )
     lines = text.splitlines()
     assert lines[0] == "Apex Signals Now PAPER status"
@@ -153,9 +167,9 @@ def test_status_header_order():
     assert "Apex Signals Now" in text
     assert "caps=$750/trade $3000 exposure 🔒" in text
     assert "WR — · 0W/0L" in text
-    assert "Universe: Allow list (4) | Stocks: OFF" in text
-    assert "Symbols: 4 pairs · tap ▼ to expand" in text
-    assert "majors_only: ON (BTC-USD,ETH-USD,SOL-USD,LINK-USD)" in text
+    assert "Universe: Allow list (5) | Stocks: OFF" in text
+    assert "Symbols: 5 pairs · tap ▼ to expand" in text
+    assert "majors_only: ON (BTC-USD,ETH-USD,SOL-USD,LINK-USD,XCN-USD)" in text
     assert "tod_custom: OFF 🔒" in text
 
 

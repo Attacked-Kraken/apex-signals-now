@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import random
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -26,6 +28,23 @@ from trading_bot.market_regime import BtcRegimeEngine
 from trading_bot.notifier import Notifier
 from trading_bot.risk_manager import RiskManager
 from trading_bot.state_store import OpsState
+from trading_bot.utils.rate_breaker import RateLimitBreaker
+from trading_bot.utils.ban_risk import BanRiskTracker, format_ban_risk_report, format_ban_risk_status_line
+from trading_bot.utils.formula_score import (
+    default_formula_memory_path,
+    evaluate_formula,
+    format_formula_report,
+    format_formula_status_line,
+    record_snapshot,
+)
+from trading_bot.utils.quant_metrics import (
+    compute_quant_snapshot,
+    dd_failure_gate,
+    format_quant_report,
+    max_drawdown_pct,
+    update_equity_peak,
+)
+from trading_bot.utils.order_rate_limit import OrderRateLimiter
 from trading_bot.strategy import check_daily_drawdown_circuit
 from trading_bot.strategy_volume_sweet_spot import VolumeSweetSpotStrategy
 from trading_bot.telegram_commands import (
@@ -48,6 +67,7 @@ from trading_bot.telegram_commands import (
     build_weekly_expectancy_digest,
     default_reset_paper_cash,
     execute_set_circuity_breaker,
+    execute_set_phd_mode,
     execute_set_stop_loss,
     execute_set_trade_profile,
     execute_set_winning_formula,
@@ -67,6 +87,14 @@ from trading_bot.telegram_commands import (
     format_wipe_paper_pending_reply,
     normalize_symbol_mode,
     parse_circuity_breaker_args,
+    parse_majors_args,
+    format_majors_status,
+    execute_set_majors,
+    MAJORS_USAGE,
+    PHD_USAGE,
+    parse_phd_args,
+    format_phd_status_line,
+    phd_weak_entry_gate,
     parse_reset_paper_args,
     parse_universe_args,
     parse_universe_stocks_args,
@@ -98,7 +126,7 @@ _TRAIL_RUNNER_PROGRESS = 75.0
 _TRAIL_RUNNER_OFFSET_PCT = 0.01
 _TIME_EXIT_FEE_CUSHION_PCT = 0.0125
 _TIME_EXIT_MAKER_WAIT_SEC = 300.0
-MAJORS_ONLY_DEFAULT = ("BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD")
+MAJORS_ONLY_DEFAULT = ("BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD", "XCN-USD")
 ENV_PATH = ROOT / ".env"
 
 
@@ -122,6 +150,16 @@ class TradingApp:
         )
         self.paper = not self.live_armed
 
+        self.rate_breaker = RateLimitBreaker(
+            trip_after=int(getattr(settings, "rate_limit_trip_after", 2) or 2),
+            cooldown_seconds=float(
+                getattr(settings, "rate_limit_cooldown_seconds", 120.0) or 120.0
+            ),
+        )
+        self.ban_risk = BanRiskTracker()
+        self.rate_breaker.ban_risk = self.ban_risk
+        self.rate_breaker.set_on_trip(self.ban_risk.note_breaker_trip)
+        min_interval = float(getattr(settings, "kraken_public_min_interval", 0.4) or 0.4)
         self.broker = KrakenBroker(
             api_key=settings.kraken_api_key,
             api_secret=settings.kraken_api_secret,
@@ -129,8 +167,15 @@ class TradingApp:
             paper=self.paper,
             paper_book_path=settings.paper_book_path,
             account_equity=settings.account_equity,
+            min_public_interval=min_interval,
+            breaker=self.rate_breaker,
         )
-        self.data_feed = DataFeed(base_url=settings.kraken_base_url)
+        self.data_feed = DataFeed(
+            base_url=settings.kraken_base_url,
+            min_interval=min_interval,
+            cache_ttl=float(getattr(settings, "ohlc_cache_seconds", 20.0) or 20.0),
+            breaker=self.rate_breaker,
+        )
         self.strategy = VolumeSweetSpotStrategy(settings)
         self.agent = AgentCore(settings, self.data_feed, self.strategy)
         self.risk = RiskManager(settings)
@@ -140,7 +185,16 @@ class TradingApp:
                 self.ops.arm_cb_auto_resume()
 
         self.risk.set_ops(_cb_pause, lambda m: asyncio.create_task(self.notifier.send(m)))
-        self.executor = Executor(self.broker, dry_run=self.dry_run, post_only=settings.post_only)
+        self.order_limiter = OrderRateLimiter(
+            max_per_minute=int(getattr(settings, "live_max_orders_per_minute", 6) or 6)
+        )
+        self.executor = Executor(
+            self.broker,
+            dry_run=self.dry_run,
+            post_only=settings.post_only,
+            order_limiter=self.order_limiter,
+            paper=self.paper,
+        )
         self.regime = BtcRegimeEngine(enabled=settings.btc_regime_enabled)
         self.smart_memory = SmartMemory(settings.trade_memory_path)
         self.grok = GrokClient(
@@ -153,6 +207,26 @@ class TradingApp:
         self.notifier = Notifier()
         self._pending_maker_time_exits: Dict[str, Dict[str, Any]] = {}
         self._enforce_winning_formula_sl()
+        self._apply_live_pacing()
+
+
+    def _apply_live_pacing(self) -> None:
+        """Tighten public REST pacing when LIVE; keep snappy settings in PAPER."""
+        if self.paper:
+            iv = float(getattr(self.settings, "kraken_public_min_interval", 0.2) or 0.2)
+            cache = float(getattr(self.settings, "ohlc_cache_seconds", 8.0) or 8.0)
+        else:
+            iv = float(getattr(self.settings, "kraken_public_min_interval_live", 0.35) or 0.35)
+            cache = float(getattr(self.settings, "ohlc_cache_live_seconds", 15.0) or 15.0)
+        self.data_feed.min_interval = iv
+        self.data_feed.cache_ttl = cache
+        self.broker.min_public_interval = iv
+        logger.info(
+            "pacing mode=%s public_interval=%.2fs ohlc_cache=%.0fs",
+            "PAPER" if self.paper else "LIVE",
+            iv,
+            cache,
+        )
 
     def _enforce_winning_formula_sl(self) -> None:
         if self.settings.winning_formula:
@@ -226,8 +300,11 @@ class TradingApp:
         positions = await self.broker.get_positions()
         fee_buf = float(self.settings.trail_fee_buffer_pct or _HWM_FLOOR_PCT)
         arm = float(self.settings.elite_fee_lock_arm_pct or fee_buf)
+        if not positions:
+            return
+        batch = await self.broker.get_tickers([p.symbol for p in positions])
         for pos in positions:
-            ticker = await self.broker.get_ticker(pos.symbol)
+            ticker = batch.get(pos.symbol) or {"mid": pos.entry}
             mark = float(ticker.get("mid") or pos.entry)
             upl = pos.unrealized_pnl_pct(mark)
             short = pos.side == "short"
@@ -359,30 +436,61 @@ class TradingApp:
     # --- scan / trade ---
 
     async def _update_btc_regime(self) -> None:
+        # Refresh regime at most every ~45s (15m OHLC is slow-moving)
+        now = time.time()
+        last = float(self.ops.extra.get("btc_regime_ts") or 0.0)
+        if now - last < 30.0 and self.ops.extra.get("btc_regime_ready"):
+            return
         bars = await self.data_feed.get_ohlc("BTC-USD", interval=15)
         closes = DataFeed.series(bars, "c") if bars else []
         self.regime.update(closes)
+        self.ops.extra["btc_regime_ts"] = now
+        self.ops.extra["btc_regime_ready"] = True
 
     async def run_once(self) -> None:
         self.ops.touch_tick()
-        await self._update_btc_regime()
+        # Always manage exits/brackets even during rate-limit cooldown
         await self._check_hard_brackets()
 
+        if self.rate_breaker.cooling_down():
+            rem = self.rate_breaker.remaining_seconds()
+            self.ops.rate_limit_cooldown_until = time.time() + rem
+            self.ops.extra["rate_limit_cooldown"] = rem
+            self.ops.extra["rate_limit_note"] = self.rate_breaker.trip_reason() or "cooling down"
+            logger.warning(
+                "rate-limit cooldown active (%.0fs left) — skipping scan/entries", rem
+            )
+            self.ops.touch_tick()
+            return
+
+        self.ops.rate_limit_cooldown_until = 0.0
+        self.ops.extra.pop("rate_limit_cooldown", None)
+        self.ops.extra.pop("rate_limit_note", None)
+
+        await self._update_btc_regime()
+
         bal = await self.broker.get_balances()
+        self._update_equity_peak(float(bal.get("equity") or 0.0))
         day_pnl = float(bal["equity"]) - float(bal["day_start_equity"])
         blocked, why = check_daily_drawdown_circuit(day_pnl, float(bal["day_start_equity"]))
         if blocked:
             logger.warning(why)
+            self.ops.touch_tick()
             return
 
         thresh, _note = self._effective_entry_threshold()
         # HIGH_VOL halves notional later; exposure check uses settings caps
         symbols = self.settings.symbol_list()
+        if bool(getattr(self.settings, "majors_only", False)):
+            majors = [s for s in MAJORS_ONLY_DEFAULT if s in set(symbols)]
+            if majors:
+                symbols = majors
         signals, elapsed_ms = await self.agent.scan(
             symbols, threshold=thresh, short_bias=self._short_bias()
         )
         self.ops.last_scan_ms = elapsed_ms
         self.ops.last_scan_n = len(symbols)
+        logger.info("scan done: %.0fms across %d pairs", elapsed_ms, len(symbols))
 
         # focus = best score
         best = max(signals, key=lambda s: s.score) if signals else None
@@ -393,10 +501,79 @@ class TradingApp:
 
         positions = await self.broker.get_positions()
         open_exposure = float(bal["exposure"])
+        available_cash = float(bal.get("cash") or 0)
         max_c = self._effective_max_concurrent()
 
+        # If focus looks like BUY but risk would deny, surface why on /status
+        if best and best.side == "BUY":
+            preview = self.risk.check_entry(
+                open_exposure_usd=open_exposure,
+                open_positions=len(positions),
+                max_concurrent=max_c,
+                paused=self.ops.paused,
+                score=best.score,
+                threshold=thresh,
+                proposed_notional=float(self.settings.max_notional_per_trade_usd),
+                available_cash=available_cash,
+            )
+            if not preview.approved:
+                self.ops.focus_blocked = preview.reason or "entry blocked"
+
+
+        # API risk gate: pause NEW entries when hygiene score is HIGH (exits still run)
+        risk_snap = self.ban_risk.evaluate(
+            settings=self.settings, paper=self.paper, breaker=self.rate_breaker
+        )
+        pause_entries = False
+        if bool(getattr(self.settings, "api_risk_pause_on_high", True)) and risk_snap.get("band") == "HIGH":
+            pause_entries = True
+            self.ops.focus_blocked = f"api_risk HIGH ({risk_snap.get('score')}/100) — new entries paused"
+            logger.warning("%s", self.ops.focus_blocked)
+        elif bool(getattr(self.settings, "api_risk_pause_on_medium", False)) and risk_snap.get("band") == "MEDIUM":
+            pause_entries = True
+            self.ops.focus_blocked = f"api_risk MEDIUM ({risk_snap.get('score')}/100) — new entries paused"
+
+        # PHD soft gate: pause NEW entries when formula band is WEAK (exits still run)
+        if not pause_entries and bool(getattr(self.settings, "phd_mode", False)):
+            try:
+                f_snap = self._evaluate_formula_snap(bal)
+                reason = phd_weak_entry_gate(
+                    phd_mode=True,
+                    formula_band=str(f_snap.get("band") or ""),
+                    formula_score=f_snap.get("score"),
+                )
+                if reason:
+                    pause_entries = True
+                    self.ops.focus_blocked = reason
+                    logger.warning("%s", reason)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("phd formula gate skipped: %s", exc)
+
+        # PHD failure-mode gate: pause NEW entries when session peak DD ≥ limit (exits OK)
+        if not pause_entries and bool(getattr(self.settings, "phd_mode", False)):
+            try:
+                eq = float(bal.get("equity") or 0.0)
+                peak = self._update_equity_peak(eq)
+                dd_pct = max_drawdown_pct(peak, eq)
+                limit = float(getattr(self.settings, "phd_max_dd_pct", 8.0) or 8.0)
+                if dd_failure_gate(dd_pct=dd_pct, limit_pct=limit):
+                    pause_entries = True
+                    self.ops.focus_blocked = (
+                        f"phd: max DD {dd_pct:.1f}% ≥ {limit:.0f}% — see /quant"
+                    )
+                    logger.warning("%s", self.ops.focus_blocked)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("phd DD gate skipped: %s", exc)
+
+        open_syms = {p.symbol for p in positions}
         for sig in sorted(signals, key=lambda s: s.score, reverse=True):
+            if pause_entries:
+                break
+
             if sig.side != "BUY":
+                continue
+            if sig.symbol in open_syms:
+                logger.info("Skip %s: already have open position (no pyramid)", sig.symbol)
                 continue
             proposed = float(self.settings.max_notional_per_trade_usd)
             macro = (sig.meta or {}).get("macro")
@@ -410,6 +587,7 @@ class TradingApp:
                 score=sig.score,
                 threshold=thresh,
                 proposed_notional=proposed,
+                available_cash=available_cash,
             )
             if not verdict.approved:
                 logger.info("Skip %s: %s", sig.symbol, verdict.reason)
@@ -424,12 +602,16 @@ class TradingApp:
                 # refresh after one entry this cycle
                 break
 
+        self.ops.touch_tick()  # end-of-cycle freshness for /status last_tick_age
+
     async def run_loop(self) -> None:
-        poll = float(self.settings.agent_poll_seconds or 30)
+        jitter = float(getattr(self.settings, "agent_poll_jitter_seconds", 0.15) or 0.0)
         logger.info(
-            "Starting Apex Signals Now (%s) poll=%.0fs strategy=%s",
+            "Starting Apex Signals Now (%s) paper_poll=%.0fs live_poll=%.0fs jitter=%.1fs strategy=%s",
             "PAPER" if self.paper else "LIVE",
-            poll,
+            float(self.settings.agent_poll_seconds or 1),
+            float(getattr(self.settings, "agent_poll_live_seconds", 4) or 4),
+            jitter,
             self.settings.strategy_mode,
         )
         while not self.ops.kill_requested:
@@ -437,7 +619,99 @@ class TradingApp:
                 await self.run_once()
             except Exception:  # noqa: BLE001
                 logger.exception("loop iteration failed")
-            await asyncio.sleep(poll)
+            if self.paper:
+                poll = float(self.settings.agent_poll_seconds or 1.0)
+            else:
+                poll = float(getattr(self.settings, "agent_poll_live_seconds", 4.0) or 4.0)
+            sleep_s = max(0.25, poll) + random.uniform(0.0, max(0.0, jitter))
+            await asyncio.sleep(sleep_s)
+
+
+    def _update_equity_peak(self, equity: float) -> float:
+        """Track session peak equity in ops.extra; return updated peak."""
+        prev = self.ops.extra.get("equity_peak")
+        peak = update_equity_peak(prev, equity)
+        self.ops.extra["equity_peak"] = peak
+        return float(peak)
+
+    def _quant_snapshot(self, bal: Optional[Dict[str, Any]] = None, *, formula_band: Optional[str] = None) -> Dict[str, Any]:
+        """Build quant metrics from balances + ops equity_peak."""
+        bal = bal or {}
+        try:
+            eq = float(bal.get("equity") or 0.0)
+        except (TypeError, ValueError):
+            eq = 0.0
+        peak = self._update_equity_peak(eq)
+        closed = bal.get("closed_trades") if isinstance(bal.get("closed_trades"), list) else []
+        return compute_quant_snapshot(
+            equity=eq,
+            equity_peak=peak,
+            closed_trades=closed,
+            phd_mode=bool(getattr(self.settings, "phd_mode", False)),
+            phd_max_dd_pct=float(getattr(self.settings, "phd_max_dd_pct", 8.0) or 8.0),
+            formula_band=formula_band,
+        )
+
+    def _formula_memory_path(self) -> Path:
+        return default_formula_memory_path(self.settings)
+
+    def _evaluate_formula_snap(self, bal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Compute formula health snap from broker/settings/ops (suggest-only)."""
+        if bal is None:
+            bal = {}
+        wins = int(bal.get("wins") or 0)
+        losses = int(bal.get("losses") or 0)
+        n = wins + losses
+        wr = (100.0 * wins / n) if n else None
+        block = str(self.ops.focus_blocked or "")
+        try:
+            wallet = float(self.broker.paper_wallet_b4()) if self.paper else float(bal.get("equity") or 0)
+        except Exception:
+            wallet = float(getattr(self.settings, "account_equity", 0) or 0)
+        closed = bal.get("closed_trades") if isinstance(bal.get("closed_trades"), list) else []
+        consec = int(self.risk.consecutive_losses())
+        tripped = bool(self.ops.paused and (getattr(self.ops, "cb_active", False) or consec >= 3))
+        pos_n = 0
+        try:
+            pos_n = len(bal.get("positions") or [])
+        except Exception:
+            pos_n = 0
+        # Prefer explicit positions_count if caller already counted open rows
+        if "positions_count" in bal:
+            try:
+                pos_n = int(bal["positions_count"])
+            except (TypeError, ValueError):
+                pass
+        snap = evaluate_formula(
+            wins=wins,
+            losses=losses,
+            win_rate_pct=wr,
+            consecutive_losses=consec,
+            entry_threshold=float(self._effective_entry_threshold()[0]),
+            winning_formula=bool(self.settings.winning_formula),
+            max_spread_pct=float(self.settings.max_spread_pct),
+            trade_profile=str(self.settings.trade_profile or "medium"),
+            stop_loss_profile=str(self.settings.stop_loss_profile or "medium"),
+            focus_block_reason=block or None,
+            focus_blocked=bool(block),
+            paper_equity=float(bal["equity"]) if bal.get("equity") is not None else None,
+            starting_equity=float(getattr(self.settings, "account_equity", 0) or 0) or None,
+            wallet_b4=wallet,
+            positions_count=pos_n,
+            max_concurrent_positions=int(getattr(self.settings, "max_concurrent_positions", 3) or 3),
+            exposure_usd=float(bal["exposure"]) if bal.get("exposure") is not None else None,
+            max_total_exposure_usd=float(self.settings.max_total_exposure_usd),
+            paused=bool(self.ops.paused),
+            circuit_breaker_on=bool(getattr(self.settings, "circuit_breaker_enabled", True)),
+            circuit_breaker_tripped=tripped,
+            closed_trades=closed,
+            cash=float(bal["cash"]) if bal.get("cash") is not None else None,
+        )
+        try:
+            record_snapshot(self._formula_memory_path(), snap)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).debug("formula memory write failed: %s", exc)
+        return snap
 
     # --- Telegram wiring ---
 
@@ -473,6 +747,8 @@ class TradingApp:
                 object.__setattr__(self.settings, "paper_trading_mode", True)
                 self.paper = True
                 self.broker.paper = True
+                self.executor.set_paper(True)
+                self._apply_live_pacing()
                 self.ops.live_confirmed = False
                 return "Switched to PAPER (local fills only)."
             if want == "live":
@@ -491,6 +767,8 @@ class TradingApp:
             self.live_armed = True
             self.paper = False
             self.broker.paper = False
+            self.executor.set_paper(False)
+            self._apply_live_pacing()
             return "LIVE confirmed — real orders enabled. Trade carefully."
 
         async def set_limit(_c: str, args: List[str]) -> str:
@@ -660,6 +938,7 @@ class TradingApp:
             )
             self.ops.clear_reset_paper_confirm()
             self.broker.reset_paper(cash)
+            self.ops.extra.pop("equity_peak", None)
             self.risk.set_consecutive_losses(0)
             account_equity_updated = False
             if explicit:
@@ -708,6 +987,7 @@ class TradingApp:
             )
             self.ops.clear_wipe_paper_confirm()
             self.broker.reset_paper(cash)
+            self.ops.extra.pop("equity_peak", None)
             self.risk.set_consecutive_losses(0)
             summary = wipe_paper_artifacts(
                 project_root=ROOT,
@@ -912,6 +1192,54 @@ class TradingApp:
                 memory_db=ROOT / self.settings.sqlite_path,
             )
 
+
+
+        async def ban_risk(_c: str, _args: List[str]) -> str:
+            snap = self.ban_risk.evaluate(
+                settings=self.settings,
+                paper=self.paper,
+                breaker=self.rate_breaker,
+            )
+            return format_ban_risk_report(snap)
+
+        async def formula(_c: str, _args: List[str]) -> str:
+            bal = await self.broker.get_balances()
+            try:
+                positions = await self.broker.get_positions()
+                bal = dict(bal)
+                bal["positions_count"] = len(positions)
+            except Exception:
+                pass
+            snap = self._evaluate_formula_snap(bal)
+            return format_formula_report(snap)
+
+        async def quant(_c: str, _args: List[str]) -> str:
+            bal = await self.broker.get_balances()
+            band = None
+            try:
+                f_snap = self._evaluate_formula_snap(dict(bal))
+                band = str(f_snap.get("band") or "") or None
+            except Exception:
+                band = None
+            q = self._quant_snapshot(bal, formula_band=band)
+            return format_quant_report(q)
+
+        async def majors(_c: str, args: List[str]) -> str:
+            action = parse_majors_args(args)
+            if action is None:
+                return MAJORS_USAGE
+            maj_list = [s for s in MAJORS_ONLY_DEFAULT if s in self.settings.symbol_list()] or list(MAJORS_ONLY_DEFAULT)
+            enabled = bool(getattr(self.settings, "majors_only", True))
+            if action == "status":
+                return format_majors_status(enabled=enabled, symbols=maj_list)
+            on = action == "on"
+            return execute_set_majors(
+                self.settings,
+                on,
+                env_path=ENV_PATH if ENV_PATH.exists() else None,
+                majors_symbols=maj_list,
+            )
+
         async def circuity_breaker_manually(_c: str, args: List[str]) -> str:
             action = parse_circuity_breaker_args(args)
             if action is None:
@@ -937,6 +1265,31 @@ class TradingApp:
             )
             return msg
 
+        async def phd(_c: str, args: List[str]) -> str:
+            action = parse_phd_args(args)
+            if action is None:
+                return PHD_USAGE
+            if action == "status":
+                return format_phd_status_line(
+                    enabled=bool(getattr(self.settings, "phd_mode", False))
+                )
+            maj_list = [s for s in MAJORS_ONLY_DEFAULT if s in self.settings.symbol_list()] or list(MAJORS_ONLY_DEFAULT)
+            on = action == "on"
+            msg = execute_set_phd_mode(
+                self.settings,
+                enabled=on,
+                env_path=ENV_PATH if ENV_PATH.exists() else None,
+                ops=self.ops,
+                signal_engine=self.strategy,
+                majors_symbols=maj_list,
+            )
+            if on:
+                for p in await self.broker.get_positions():
+                    await self._apply_profile_brackets(
+                        p.symbol, p.entry, qty=p.qty, short=p.side == "short"
+                    )
+            return msg
+
         async def help_cmd(_c: str, _a: List[str]) -> str:
             from trading_bot.telegram_commands import BOT_COMMAND_SPECS
 
@@ -955,6 +1308,16 @@ class TradingApp:
             "set_threshold_custom": set_threshold_custom,
             "set_spread": set_spread,
             "tod_custom": tod_custom,
+            "majors": majors,
+            "major": majors,
+            "ban_risk": ban_risk,
+            "api_risk": ban_risk,
+            "formula": formula,
+            "formula_score": formula,
+            "phd": phd,
+            "phd_mode": phd,
+            "quant": quant,
+            "quant_metrics": quant,
             "stop_loss": stop_loss,
             "winning_formula": winning_formula,
             "aggressive": aggressive,
@@ -1056,6 +1419,21 @@ class TradingApp:
         if hasattr(self.ops, "cb_enabled"):
             cb_enabled = bool(getattr(self.ops, "cb_enabled", cb_enabled))
 
+        _risk = self.ban_risk.evaluate(
+            settings=self.settings, paper=self.paper, breaker=self.rate_breaker
+        )
+        _formula_bal = dict(bal)
+        _formula_bal["positions_count"] = len(pos_rows)
+        _formula = self._evaluate_formula_snap(_formula_bal)
+        quant_line = None
+        if bool(getattr(self.settings, "quant_metrics_on_status", True)):
+            try:
+                _q = self._quant_snapshot(
+                    bal, formula_band=str(_formula.get("band") or "") or None
+                )
+                quant_line = _q.get("status_line")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("quant status line skipped: %s", exc)
         text = format_status_reply(
             paper_cash=float(bal["cash"]),
             paper_equity=float(bal["equity"]),
@@ -1092,12 +1470,21 @@ class TradingApp:
             stop_loss_effective_pct=sl_pct,
             stop_loss_clamped=clamped,
             winning_formula=bool(self.settings.winning_formula),
+            api_risk_line=format_ban_risk_status_line(_risk),
+            formula_score_line=format_formula_status_line(_formula),
+            phd_mode=bool(getattr(self.settings, "phd_mode", False)),
+            quant_line=quant_line,
             circuit_breaker_on=cb_enabled,
             circuit_breaker_consec_losses=int(self.risk.consecutive_losses()),
             caps_locked=bool(getattr(self.settings, "caps_custom_lock", False)),
             majors_only=bool(getattr(self.settings, "majors_only", True)),
             majors_symbols=majors,
         )
+        if self.rate_breaker.cooling_down():
+            rem = self.rate_breaker.remaining_seconds()
+            self.ops.extra["rate_limit_cooldown"] = rem
+            text = text.rstrip() + f"\n⚠️ Rate-limit cooldown: {rem:.0f}s remaining"
+
         n = len(list(status_symbols or []))
         if n > 0:
             return status_with_symbols_button(text, symbol_count=n)

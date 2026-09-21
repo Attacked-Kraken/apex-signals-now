@@ -95,6 +95,16 @@ BOT_COMMAND_SPECS: List[Tuple[str, str]] = [
     ("grok", "Grok sentiment"),
     ("regime", "Market regime"),
     ("logs", "Tail paper log"),
+    ("majors", "Majors-only scan on/off/status"),
+    ("ban_risk", "API ban-risk hygiene score"),
+    ("api_risk", "Alias for /ban_risk"),
+    ("formula", "Formula health score + tips"),
+    ("formula_score", "Alias for /formula"),
+    ("phd", "PHD mode on/off/status (Tier-1 + WEAK gate)"),
+    ("phd_mode", "Alias for /phd"),
+    ("quant", "Session risk metrics + DD gate"),
+    ("quant_metrics", "Alias for /quant"),
+    ("major", "Alias for /majors"),
     ("universe", "Crypto universe mode"),
     ("universe_all", "Kraken discovery"),
     ("universe_stocks", "Toggle xStocks"),
@@ -107,6 +117,7 @@ BOT_COMMAND_SPECS: List[Tuple[str, str]] = [
 KNOWN_COMMANDS = {c for c, _ in BOT_COMMAND_SPECS}
 
 ENV_KEY_WINNING_FORMULA = "WINNING_FORMULA"
+ENV_KEY_PHD_MODE = "PHD_MODE"
 
 STOP_LOSS_PRESETS = {
     "tight": {
@@ -555,6 +566,10 @@ def format_status_reply(
     stop_loss_effective_pct: Optional[float] = None,
     stop_loss_clamped: bool = False,
     winning_formula: bool = False,
+    api_risk_line: Optional[str] = None,
+    formula_score_line: Optional[str] = None,
+    phd_mode: Optional[bool] = None,
+    quant_line: Optional[str] = None,
     circuit_breaker_on: bool = False,
     circuit_breaker_consec_losses: int = 0,
     caps_locked: bool = False,
@@ -634,7 +649,19 @@ def format_status_reply(
         except (TypeError, ValueError):
             pass
     lines.append(f"last_tick_age={tick_s}")
-    lines.append("")  # space between tick age and circuit breaker
+    lines.append("")  # space before api risk / circuit breaker
+    if api_risk_line:
+        lines.append(str(api_risk_line).strip())
+        lines.append("")
+    if formula_score_line:
+        lines.append(str(formula_score_line).strip())
+        lines.append("")
+    if phd_mode is not None:
+        lines.append(format_phd_status_line(enabled=bool(phd_mode)))
+        lines.append("")
+    if quant_line:
+        lines.append(str(quant_line).strip())
+        lines.append("")
     cb_state = "ON" if circuit_breaker_on else "OFF"
     try:
         cl = max(0, int(circuit_breaker_consec_losses))
@@ -965,6 +992,200 @@ def format_position_block(
 # ---------------------------------------------------------------------------
 # /circuity_breaker_manually — ported from production Instance #2 tg_i2.py
 # ---------------------------------------------------------------------------
+
+
+# /majors — filter scan universe to BTC/ETH/SOL/LINK/XCN (Onyxcoin)
+MAJORS_USAGE = "Usage: /majors [on|off|status]"
+MAJORS_DEFAULT_SYMBOLS = ("BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD", "XCN-USD")
+
+
+def parse_majors_args(args: Sequence[str]) -> Optional[str]:
+    """Return on|off|status, or None if invalid. Bare /majors → status."""
+    if not args:
+        return "status"
+    raw = str(args[0]).strip().lower()
+    if raw in ("on", "1", "true", "enable", "enabled"):
+        return "on"
+    if raw in ("off", "0", "false", "disable", "disabled"):
+        return "off"
+    if raw in ("status", "stat", "show", "?"):
+        return "status"
+    return None
+
+
+def format_majors_status(
+    *,
+    enabled: bool,
+    symbols: Optional[Sequence[str]] = None,
+) -> str:
+    state = "ON" if enabled else "OFF"
+    maj = [str(s) for s in (symbols or MAJORS_DEFAULT_SYMBOLS) if s]
+    if enabled and maj:
+        return f"majors_only: {state} (" + ",".join(maj) + ")"
+    return f"majors_only: {state}"
+
+
+def execute_set_majors(
+    settings: Any,
+    enabled: bool,
+    *,
+    env_path: Optional[Path] = None,
+    majors_symbols: Optional[Sequence[str]] = None,
+) -> str:
+    """Persist MAJORS_ONLY and mutate runtime Settings."""
+    object.__setattr__(settings, "majors_only", bool(enabled))
+    os.environ["MAJORS_ONLY"] = "true" if enabled else "false"
+    if env_path is not None:
+        _persist_env(Path(env_path), {"MAJORS_ONLY": "true" if enabled else "false"})
+    return format_majors_status(enabled=bool(enabled), symbols=majors_symbols)
+
+
+# /phd — Professional High Discipline ops pack + WEAK formula soft entry gate
+PHD_USAGE = "Usage: /phd [on|off|status]"
+
+
+def parse_phd_args(args: Sequence[str]) -> Optional[str]:
+    """Return on|off|status, or None if invalid. Bare /phd → status."""
+    if not args:
+        return "status"
+    raw = str(args[0]).strip().lower()
+    if raw in ("on", "1", "true", "enable", "enabled"):
+        return "on"
+    if raw in ("off", "0", "false", "disable", "disabled"):
+        return "off"
+    if raw in ("status", "stat", "show", "?"):
+        return "status"
+    return None
+
+
+def format_phd_status_line(*, enabled: bool) -> str:
+    return f"phd: {'ON' if enabled else 'OFF'}"
+
+
+def phd_weak_entry_gate(
+    *,
+    phd_mode: bool,
+    formula_band: Optional[str] = None,
+    formula_score: Optional[int] = None,
+) -> Optional[str]:
+    """If PHD on and formula band WEAK, return focus_blocked reason (entries only).
+
+    Does not mutate settings / knobs. Exits remain caller's responsibility.
+    """
+    if not phd_mode:
+        return None
+    band = str(formula_band or "").strip().upper()
+    if band != "WEAK":
+        return None
+    try:
+        n = int(formula_score) if formula_score is not None else 0
+    except (TypeError, ValueError):
+        n = 0
+    return f"phd: formula WEAK ({n}/100) — see /formula"
+
+
+def clear_phd_focus_block(ops: Any) -> bool:
+    """Clear ops.focus_blocked when it is a phd-prefixed soft gate. Returns True if cleared."""
+    if ops is None:
+        return False
+    try:
+        cur = str(getattr(ops, "focus_blocked", "") or "")
+    except Exception:  # noqa: BLE001
+        return False
+    if cur.startswith("phd:"):
+        try:
+            ops.focus_blocked = ""
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+    return False
+
+
+def format_phd_on_reply(*, majors_symbols: Optional[Sequence[str]] = None) -> str:
+    maj = [str(s) for s in (majors_symbols or MAJORS_DEFAULT_SYMBOLS) if s]
+    maj_s = ",".join(maj) if maj else "BTC-USD,ETH-USD,SOL-USD,LINK-USD,XCN-USD"
+    return (
+        "🎓 PHD mode ON (Professional High Discipline)\n"
+        "• winning_formula: ON (Tier-1)\n"
+        "• Profile: MEDIUM (label; WF knobs kept)\n"
+        "• stop_loss: MEDIUM\n"
+        "• circuit_breaker: ON\n"
+        f"• majors_only: ON ({maj_s})\n"
+        "• Soft gate: block NEW entries when formula WEAK "
+        "(exits OK; /formula tips not auto-applied)"
+    )
+
+
+def format_phd_off_reply(*, winning_formula_left: bool) -> str:
+    wf = "ON" if winning_formula_left else "OFF"
+    return (
+        f"PHD mode OFF\n"
+        f"• phd_mode cleared; WEAK soft gate disabled\n"
+        f"• winning_formula left as-is ({wf}) — not auto-turned off"
+    )
+
+
+def execute_set_phd_mode(
+    settings: Any,
+    *,
+    enabled: bool,
+    env_path: Optional[Path] = None,
+    environ: Optional[MutableMapping[str, str]] = None,
+    ops: Any = None,
+    signal_engine: Any = None,
+    majors_symbols: Optional[Sequence[str]] = None,
+) -> str:
+    """Apply or clear PHD pack. ON forces Tier-1 helpers; OFF only clears phd_mode + gate."""
+    env = environ if environ is not None else os.environ
+    if enabled:
+        # Tier-1 stack via existing helpers (WF also forces SL medium + CB on)
+        execute_set_winning_formula(
+            settings,
+            enabled=True,
+            env_path=env_path,
+            environ=env if isinstance(env, dict) else None,
+            signal_engine=signal_engine,
+        )
+        # Label profile medium without execute_set_trade_profile (that clears WF)
+        object.__setattr__(settings, "trade_profile", "medium")
+        env["TRADE_PROFILE"] = "medium"
+        execute_set_stop_loss(
+            settings, "medium", env_path=env_path, signal_engine=signal_engine
+        )
+        execute_set_circuity_breaker(
+            settings,
+            enabled=True,
+            env_path=env_path,
+            environ=env,
+            ops=ops,
+            consec=0,
+            tripped=False,
+        )
+        execute_set_majors(
+            settings,
+            True,
+            env_path=env_path,
+            majors_symbols=majors_symbols,
+        )
+        object.__setattr__(settings, "phd_mode", True)
+        env[ENV_KEY_PHD_MODE] = "true"
+        updates = {
+            ENV_KEY_PHD_MODE: "true",
+            "TRADE_PROFILE": "medium",
+        }
+        if env_path:
+            _persist_env(Path(env_path), updates)
+        return format_phd_on_reply(majors_symbols=majors_symbols)
+
+    object.__setattr__(settings, "phd_mode", False)
+    env[ENV_KEY_PHD_MODE] = "false"
+    if env_path:
+        _persist_env(Path(env_path), {ENV_KEY_PHD_MODE: "false"})
+    clear_phd_focus_block(ops)
+    return format_phd_off_reply(
+        winning_formula_left=bool(getattr(settings, "winning_formula", False))
+    )
+
 
 CIRCUITY_BREAKER_USAGE = "Usage: /circuity_breaker_manually [on|off|status]"
 

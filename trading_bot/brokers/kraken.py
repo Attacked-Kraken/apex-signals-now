@@ -7,12 +7,14 @@ import logging
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 from trading_bot.brokers.base import BrokerBase
 from trading_bot.models import OrderResult, Position, utcnow
+from trading_bot.utils.http_errors import RateLimitError, raise_for_rate_limit
+from trading_bot.utils.rate_breaker import RateLimitBreaker
 from trading_bot.utils.retry import with_exponential_backoff
 
 logger = logging.getLogger(__name__)
@@ -31,7 +33,8 @@ class KrakenBroker(BrokerBase):
         paper: bool = True,
         paper_book_path: str = "data/paper_book_2.json",
         account_equity: float = 1600.0,
-        min_public_interval: float = 0.35,
+        min_public_interval: float = 0.2,
+        breaker: Optional[RateLimitBreaker] = None,
     ):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -40,8 +43,11 @@ class KrakenBroker(BrokerBase):
         self.paper_book_path = Path(paper_book_path)
         self.account_equity = float(account_equity)
         self.min_public_interval = min_public_interval
+        self.breaker = breaker
         self._last_public = 0.0
         self._client: Optional[httpx.AsyncClient] = None
+        self._ticker_cache: Dict[str, Tuple[float, Dict[str, float]]] = {}
+        self._ticker_cache_ttl = 1.0
         self._ensure_book(account_equity)
 
     def _ensure_book(self, equity: float) -> None:
@@ -101,16 +107,26 @@ class KrakenBroker(BrokerBase):
     async def _public_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         await self._throttle_public()
 
+        def _on_rl(exc: RateLimitError) -> None:
+            if self.breaker is not None:
+                self.breaker.record_rate_limit(exc.retry_after)
+
         async def _do() -> Dict[str, Any]:
             client = await self._get_client()
             r = await client.get(path, params=params or {})
+            raise_for_rate_limit(r, label=f"kraken_public:{path}")
             r.raise_for_status()
             data = r.json()
             if data.get("error"):
                 raise RuntimeError(f"Kraken public error: {data['error']}")
             return data.get("result") or data
 
-        return await with_exponential_backoff(_do, label=f"kraken_public:{path}")
+        result = await with_exponential_backoff(
+            _do, label=f"kraken_public:{path}", on_rate_limit=_on_rl
+        )
+        if self.breaker is not None:
+            self.breaker.record_success()
+        return result
 
     async def _private_order_blocked(self, method: str) -> None:
         if self.paper and method in _PRIVATE_ORDER_METHODS:
@@ -120,6 +136,10 @@ class KrakenBroker(BrokerBase):
             )
 
     async def get_ticker(self, symbol: str) -> Dict[str, float]:
+        now = time.time()
+        hit = self._ticker_cache.get(symbol)
+        if hit and now - hit[0] < self._ticker_cache_ttl:
+            return hit[1]
         pair = self._to_kraken_pair(symbol)
         try:
             result = await self._public_get("/0/public/Ticker", {"pair": pair})
@@ -129,7 +149,9 @@ class KrakenBroker(BrokerBase):
             bid = float(row["b"][0])
             ask = float(row["a"][0])
             last = float(row["c"][0])
-            return {"bid": bid, "ask": ask, "last": last, "mid": (bid + ask) / 2.0}
+            out = {"bid": bid, "ask": ask, "last": last, "mid": (bid + ask) / 2.0}
+            self._ticker_cache[symbol] = (now, out)
+            return out
         except Exception as exc:  # noqa: BLE001
             logger.warning("ticker %s failed: %s — using book fallback", symbol, exc)
             book = self._read_book()
@@ -139,6 +161,49 @@ class KrakenBroker(BrokerBase):
                 return {"bid": px, "ask": px, "last": px, "mid": px}
             # dry synthetic
             return {"bid": 0.0, "ask": 0.0, "last": 0.0, "mid": 0.0}
+
+
+    async def get_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, float]]:
+        """Batch public Ticker for many symbols in one request (faster marks)."""
+        out: Dict[str, Dict[str, float]] = {}
+        need: List[str] = []
+        now = time.time()
+        for sym in symbols:
+            hit = self._ticker_cache.get(sym)
+            if hit and now - hit[0] < self._ticker_cache_ttl:
+                out[sym] = hit[1]
+            else:
+                need.append(sym)
+        if not need:
+            return out
+        pairs = ",".join(self._to_kraken_pair(s) for s in need)
+        pair_to_sym = {self._to_kraken_pair(s): s for s in need}
+        try:
+            result = await self._public_get("/0/public/Ticker", {"pair": pairs})
+            for key, row in (result or {}).items():
+                # Kraken may return altname keys; map best-effort
+                sym = pair_to_sym.get(key)
+                if sym is None:
+                    for pk, s in pair_to_sym.items():
+                        if key.endswith(pk) or pk in key or key in pk:
+                            sym = s
+                            break
+                if sym is None:
+                    continue
+                bid = float(row["b"][0])
+                ask = float(row["a"][0])
+                last = float(row["c"][0])
+                tick = {"bid": bid, "ask": ask, "last": last, "mid": (bid + ask) / 2.0}
+                self._ticker_cache[sym] = (now, tick)
+                out[sym] = tick
+            for sym in need:
+                if sym not in out:
+                    out[sym] = await self.get_ticker(sym)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("batch ticker failed: %s — falling back per-symbol", exc)
+            for sym in need:
+                out[sym] = await self.get_ticker(sym)
+        return out
 
     async def place_order(
         self,

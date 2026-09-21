@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 
+from trading_bot.utils.http_errors import RateLimitError, raise_for_rate_limit
+from trading_bot.utils.rate_breaker import RateLimitBreaker
 from trading_bot.utils.retry import with_exponential_backoff
 
 logger = logging.getLogger(__name__)
@@ -18,10 +20,14 @@ class DataFeed:
         self,
         base_url: str = "https://api.kraken.com",
         *,
-        min_interval: float = 0.12,
+        min_interval: float = 0.2,
+        cache_ttl: float = 8.0,
+        breaker: Optional[RateLimitBreaker] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.min_interval = min_interval
+        self.cache_ttl = float(cache_ttl)
+        self.breaker = breaker
         self._last = 0.0
         self._lock = asyncio.Lock()
         self._client: Optional[httpx.AsyncClient] = None
@@ -60,15 +66,20 @@ class DataFeed:
         cache_key = f"{symbol}:{interval}"
         now = time.time()
         hit = self._cache.get(cache_key)
-        if hit and now - hit[0] < 8:
+        if hit and now - hit[0] < self.cache_ttl:
             return hit[1]
 
         await self._throttle()
         pair = self._pair(symbol)
 
+        def _on_rl(exc: RateLimitError) -> None:
+            if self.breaker is not None:
+                self.breaker.record_rate_limit(exc.retry_after)
+
         async def _do() -> List[Dict[str, float]]:
             client = await self._client_get()
             r = await client.get("/0/public/OHLC", params={"pair": pair, "interval": interval})
+            raise_for_rate_limit(r, label=f"ohlc:{symbol}")
             r.raise_for_status()
             data = r.json()
             if data.get("error"):
@@ -91,9 +102,17 @@ class DataFeed:
             return bars
 
         try:
-            bars = await with_exponential_backoff(_do, label=f"ohlc:{symbol}")
+            bars = await with_exponential_backoff(
+                _do, label=f"ohlc:{symbol}", on_rate_limit=_on_rl
+            )
             self._cache[cache_key] = (now, bars)
+            if self.breaker is not None:
+                self.breaker.record_success()
             return bars
+        except RateLimitError as exc:
+            # breaker already updated via on_rate_limit during retries
+            logger.warning("OHLC %s rate-limited: %s", symbol, exc)
+            return hit[1] if hit else []
         except Exception as exc:  # noqa: BLE001
             logger.warning("OHLC %s failed: %s", symbol, exc)
             return hit[1] if hit else []

@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any
 
 from trading_bot.utils.retry import with_exponential_backoff
 
@@ -12,8 +12,10 @@ logger = logging.getLogger(__name__)
 
 
 class GrokClient:
-    """Uses OpenAI-compatible client at https://api.x.ai/v1 with XAI_API_KEY.
+    """OpenAI-compatible client at https://api.x.ai/v1 with XAI_API_KEY.
+
     Never browser/consumer chat automation. AI is analyzer-only — no orders.
+    Uses httpx against the official chat/completions endpoint (stable).
     """
 
     def __init__(
@@ -45,34 +47,17 @@ class GrokClient:
     def _ensure_client(self) -> Any:
         if self._client is not None:
             return self._client
-        # Prefer xai_sdk; fall back to OpenAI-compatible httpx
-        try:
-            from xai_sdk import Client  # type: ignore
+        import httpx
 
-            self._client = ("xai_sdk", Client(api_key=self.api_key))
-            return self._client
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            from openai import AsyncOpenAI  # type: ignore
-
-            self._client = (
-                "openai",
-                AsyncOpenAI(api_key=self.api_key, base_url=self.base_url),
-            )
-            return self._client
-        except Exception:  # noqa: BLE001
-            import httpx
-
-            self._client = ("httpx", httpx.AsyncClient(
-                base_url=self.base_url,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "User-Agent": "ApexSignalsNow/2.0 (+xai-official)",
-                },
-                timeout=60.0,
-            ))
-            return self._client
+        self._client = httpx.AsyncClient(
+            base_url=self.base_url,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "User-Agent": "ApexSignalsNow/2.0 (+xai-official)",
+            },
+            timeout=60.0,
+        )
+        return self._client
 
     async def analyze_sentiment(self, prompt: str) -> str:
         """Sentiment/signal text only — never places orders."""
@@ -80,13 +65,14 @@ class GrokClient:
             return "Grok not configured (set XAI_API_KEY for official api.x.ai)."
 
         await self._throttle()
-        kind, client = self._ensure_client()
+        client = self._ensure_client()
 
         async def _do() -> str:
-            if kind == "openai":
-                resp = await client.chat.completions.create(
-                    model=self.model,
-                    messages=[
+            r = await client.post(
+                "/chat/completions",
+                json={
+                    "model": self.model,
+                    "messages": [
                         {
                             "role": "system",
                             "content": (
@@ -96,40 +82,24 @@ class GrokClient:
                         },
                         {"role": "user", "content": prompt},
                     ],
-                    max_tokens=400,
+                    "max_tokens": 400,
+                },
+            )
+            if r.status_code == 403:
+                detail = ""
+                try:
+                    detail = r.json().get("error") or r.text
+                except Exception:  # noqa: BLE001
+                    detail = r.text
+                return (
+                    "Grok API 403: team has no credits/licenses yet. "
+                    f"Add billing at https://console.x.ai — {detail}"
                 )
-                return (resp.choices[0].message.content or "").strip()
-            if kind == "httpx":
-                r = await client.post(
-                    "/chat/completions",
-                    json={
-                        "model": self.model,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You are a crypto market sentiment analyzer. "
-                                    "Brief sentiment only. Never place orders."
-                                ),
-                            },
-                            {"role": "user", "content": prompt},
-                        ],
-                        "max_tokens": 400,
-                    },
-                )
-                r.raise_for_status()
-                data = r.json()
-                return data["choices"][0]["message"]["content"].strip()
-            # xai_sdk sync bridge
-            def _sync() -> str:
-                # Best-effort; SDK shapes vary
-                chat = client.chat.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                return str(getattr(chat, "content", chat))
-
-            return await asyncio.to_thread(_sync)
+            if r.status_code == 429:
+                r.raise_for_status()  # backoff retry
+            r.raise_for_status()
+            data = r.json()
+            return (data["choices"][0]["message"]["content"] or "").strip()
 
         try:
             return await with_exponential_backoff(_do, label="xai_grok")
@@ -138,6 +108,6 @@ class GrokClient:
             return f"Grok error: {exc}"
 
     async def close(self) -> None:
-        if self._client and self._client[0] == "httpx":
-            await self._client[1].aclose()
+        if self._client is not None:
+            await self._client.aclose()
         self._client = None
