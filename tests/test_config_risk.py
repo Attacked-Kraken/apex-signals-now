@@ -86,10 +86,10 @@ def test_winning_formula_and_presets():
     msg = execute_set_winning_formula(s, enabled=True, env_path=None)
     assert "WINNING FORMULA ACTIVATED" in msg
     assert s.winning_formula is True
-    assert s.entry_threshold == 50.0
-    assert s.trail_fee_buffer_pct == 0.012
+    assert s.entry_threshold == 60.0
+    assert s.trail_fee_buffer_pct == 0.0125
     assert s.tp1_fraction == 0.0
-    assert os.environ.get("ENTRY_THRESHOLD") == "50"
+    assert os.environ.get("ENTRY_THRESHOLD") == "60"
 
 
 def test_bear_threshold_helper():
@@ -99,11 +99,11 @@ def test_bear_threshold_helper():
             floor = 65.0 if winning_formula else 50.0
             return max(base * 1.10, floor)
         if winning_formula:
-            return max(base, 50.0)
+            return max(base, 60.0)
         return base
 
     assert bear_spot_long_threshold(50, short_bias=True, winning_formula=True) == 65.0
-    assert bear_spot_long_threshold(50, short_bias=False, winning_formula=True) == 50.0
+    assert bear_spot_long_threshold(60, short_bias=False, winning_formula=True) == 60.0
     assert bear_spot_long_threshold(40, short_bias=False, winning_formula=False) == 40.0
 
 
@@ -111,30 +111,52 @@ def test_status_header_order():
     from trading_bot.telegram_commands import format_status_reply
 
     text = format_status_reply(
-        paper=True,
-        cash=1600,
-        equity=1600,
-        wins=0,
-        losses=0,
+        paper_cash=3000.0,
+        paper_equity=3000.0,
+        wallet_b4=3000.0,
+        positions=[],
         paused=False,
-        market_label="BULL_OK",
-        short_bias=False,
-        max_trade=1000,
-        max_exposure=3000,
-        winning_formula=True,
+        strategy_mode="volume_sweet_spot",
+        last_tick_age_seconds=0.1,
+        paper=True,
+        symbols=["BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD"],
+        max_notional_per_trade=750.0,
+        max_total_exposure=3000.0,
+        entry_threshold=60,
+        max_spread_pct=0.002,
         trade_profile="medium",
-        tod_custom="ON",
-        stop_loss_line="🟡 MEDIUM −1.50%",
-        threshold=50,
-        spread_cap=0.0025,
-        target_setup="LONG (Spot Mode)",
-        proximity_score=40,
-        proximity_threshold=50,
+        market_state="BULL_OK",
+        session_wins=0,
+        session_losses=0,
+        symbol_mode="ALLOWLIST",
+        universe_stocks=False,
+        stock_count=0,
+        tod_gate_enabled=False,
+        tod_custom_lock=True,
+        stop_loss_profile="medium",
+        winning_formula=True,
+        circuit_breaker_on=True,
+        circuit_breaker_consec_losses=0,
+        caps_locked=True,
+        majors_only=True,
+        majors_symbols=["BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD"],
+        entry_proximity={"score": 40.0, "direction": "WAIT", "symbol": "BTC-USD", "price": 81348.70},
+        last_scan_latency_ms=0,
+        last_scan_pair_count=4,
     )
     lines = text.splitlines()
     assert lines[0] == "Apex Signals Now PAPER status"
+    assert "Wallet B4" in text
+    assert "circuit breaker" in text
     assert "winning_formula: ON" in text
-    assert "caps=$1000/trade $3000 exposure" in text
+    assert "Entry Proximity" in text
+    assert "Apex Signals Now" in text
+    assert "caps=$750/trade $3000 exposure 🔒" in text
+    assert "WR — · 0W/0L" in text
+    assert "Universe: Allow list (4) | Stocks: OFF" in text
+    assert "Symbols: 4 pairs · tap ▼ to expand" in text
+    assert "majors_only: ON (BTC-USD,ETH-USD,SOL-USD,LINK-USD)" in text
+    assert "tod_custom: OFF 🔒" in text
 
 
 def test_regime_normalize():

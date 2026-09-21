@@ -14,7 +14,7 @@ from typing import Any, Awaitable, Callable, Dict, List, MutableMapping, Optiona
 
 import httpx
 
-from trading_bot.utils.entry_proximity import progress_bar, proximity_bar
+from trading_bot.utils.entry_proximity import get_entry_threshold, make_progress_bar, progress_bar, proximity_bar
 from trading_bot.utils.retry import with_exponential_backoff
 
 logger = logging.getLogger(__name__)
@@ -144,6 +144,9 @@ _WF_SAVED_KEYS = (
     "elite_fee_lock_arm_pct",
     "tp1_fraction",
     "stop_loss_profile",
+    "taker_fee_rate",
+    "maker_fee_rate",
+    "circuit_breaker_enabled",
 )
 
 
@@ -221,15 +224,49 @@ def execute_set_stop_loss(
     )
 
 
+
+def normalize_stop_loss_profile(raw: Any) -> str:
+    n = str(raw or "").strip().lower()
+    if n in ("loose", "wide", "free"):
+        return "free"
+    if n in ("tight", "t", "red"):
+        return "tight"
+    if n in ("medium", "med", "m", "yellow", "bal", "balanced", ""):
+        return "medium"
+    if n in STOP_LOSS_PRESETS:
+        return n
+    return "medium"
+
+
+def format_stop_loss_status_line(
+    profile: str,
+    *,
+    effective_sl_pct: float | None = None,
+    clamped: bool = False,
+) -> str:
+    """Compact /status line under Profile (optional WF BEAR effective %)."""
+    try:
+        name = normalize_stop_loss_profile(profile)
+    except Exception:
+        name = "medium"
+    p = STOP_LOSS_PRESETS.get(name, STOP_LOSS_PRESETS["medium"])
+    sl = float(effective_sl_pct) if effective_sl_pct is not None else float(p["sl_pct"])
+    note = " (WF BEAR clamp)" if clamped else ""
+    return f"stop_loss: {p['emoji']} {p['label']} −{sl * 100:.2f}%{note}"
+
+
+def format_winning_formula_status_line(*, enabled: bool) -> str:
+    return "winning_formula: ON 🚀" if enabled else "winning_formula: OFF"
+
+
 def format_winning_formula_activated() -> str:
     return (
         "🚀 WINNING FORMULA ACTIVATED\n"
-        "• SL auto → 🟡 MEDIUM −1.50% / TP +2.25%\n"
-        "• BEAR clamp: max SL −1.25% (≤$6 risk on $500)\n"
-        "• BULL: full MEDIUM profile allowed\n"
-        "• Threshold 65% BEAR / 50% BULL · max 1 pos in BEAR\n"
-        "• Trail arm +1.20% · full exits · maker time-exits\n"
-        "• Circuit: 3 consec losses or −3% daily DD"
+        "• SL → 🟡 MEDIUM −1.50% / TP ~+2.25% (BEAR clamp −1.25% / ≤$6@$500)\n"
+        "• Threshold 65% BEAR / 60% BULL · max 1 pos in BEAR\n"
+        "• Tier-1 fees 0.80%/0.40% · HWM peak +1.20% → SL +1.25%\n"
+        "• Time-exit maker ≥+1.25% · full exits (no partials)\n"
+        "• Circuit: 3 consec losses · 45m gated auto-resume"
     )
 
 
@@ -246,24 +283,34 @@ def execute_set_winning_formula(
     if enabled:
         saved = {k: getattr(settings, k, None) for k in _WF_SAVED_KEYS}
         object.__setattr__(settings, "_winning_formula_saved", saved)
-        object.__setattr__(settings, "entry_threshold", 50.0)
-        apply_runtime_entry_threshold(settings, 50.0)
-        env["ENTRY_THRESHOLD"] = "50"  # beat shell leftovers
+        # Tier-1 best stack (Sep 2026): BULL base 60 / BEAR floor 65 at runtime
+        object.__setattr__(settings, "entry_threshold", 60.0)
+        apply_runtime_entry_threshold(settings, 60.0)
+        env["ENTRY_THRESHOLD"] = "60"  # beat shell leftovers
         object.__setattr__(settings, "max_concurrent_positions", 3)  # BEAR cap → 1 live
         object.__setattr__(settings, "min_tp_pct", 0.0305)
         object.__setattr__(settings, "atr_bracket_tp_min_pct", 0.0305)
-        object.__setattr__(settings, "trail_fee_buffer_pct", 0.012)
-        object.__setattr__(settings, "elite_fee_lock_arm_pct", 0.012)
+        object.__setattr__(settings, "trail_fee_buffer_pct", 0.0125)  # +1.25% floor
+        object.__setattr__(settings, "elite_fee_lock_arm_pct", 0.012)  # arm at RT +1.20%
         object.__setattr__(settings, "tp1_fraction", 0.0)
+        object.__setattr__(settings, "taker_fee_rate", 0.008)
+        object.__setattr__(settings, "maker_fee_rate", 0.004)
+        try:
+            object.__setattr__(settings, "circuit_breaker_enabled", True)
+        except Exception:
+            pass
         execute_set_stop_loss(settings, "medium", env_path=env_path, signal_engine=signal_engine)
         updates.update(
             {
-                "ENTRY_THRESHOLD": "50",
+                "ENTRY_THRESHOLD": "60",
                 "MAX_CONCURRENT_POSITIONS": "3",
                 "MIN_TP_PCT": "0.0305",
-                "TRAIL_FEE_BUFFER_PCT": "0.012",
+                "TRAIL_FEE_BUFFER_PCT": "0.0125",
                 "ELITE_FEE_LOCK_ARM_PCT": "0.012",
                 "TP1_FRACTION": "0",
+                "TAKER_FEE_RATE": "0.008",
+                "MAKER_FEE_RATE": "0.004",
+                "CIRCUIT_BREAKER_ENABLED": "true",
             }
         )
         object.__setattr__(settings, "winning_formula", True)
@@ -323,74 +370,430 @@ def execute_set_trade_profile(
 
 def format_status_reply(
     *,
-    paper: bool,
-    cash: float,
-    equity: float,
-    wins: int,
-    losses: int,
+    paper_cash: float,
+    paper_equity: float,
+    wallet_b4: Optional[float] = None,
+    positions: Sequence[Dict[str, Any]],
     paused: bool,
-    market_label: str,
-    short_bias: bool,
-    max_trade: float,
-    max_exposure: float,
-    winning_formula: bool,
-    trade_profile: str,
-    tod_custom: str,
-    stop_loss_line: str,
-    threshold: float,
-    threshold_note: str = "",
-    spread_cap: float,
-    target_setup: str,
-    proximity_score: float,
-    proximity_threshold: float,
-    focus: str = "",
-    positions_block: str = "positions: (none)",
-    universe: str = "ALLOWLIST",
-    last_scan_ms: Optional[float] = None,
-    last_scan_n: Optional[int] = None,
-    last_tick_age: Optional[str] = None,
+    strategy_mode: str,
+    last_tick_age_seconds: Optional[float],
+    paper: bool = True,
+    symbols: Optional[Sequence[str]] = None,
+    max_notional_per_trade: Optional[float] = None,
+    max_total_exposure: Optional[float] = None,
+    target_setup: Optional[str] = None,
+    entry_proximity: Optional[Dict[str, Any]] = None,
+    focus_symbol: Optional[str] = None,
+    focus_price: Optional[float] = None,
+    entry_threshold: Optional[float] = None,
+    max_spread_pct: Optional[float] = None,
+    trade_profile: Optional[str] = None,
+    pid: Optional[int] = None,  # deprecated — ignored (kept for call-site compat)
+    last_scan_latency_ms: Optional[float] = None,
+    last_scan_pair_count: Optional[int] = None,
+    market_state: Optional[str] = None,
+    win_rate_pct: Optional[float] = None,
+    session_wins: Optional[int] = None,
+    session_losses: Optional[int] = None,
+    symbol_mode: Optional[str] = None,
+    universe_stocks: Optional[bool] = None,
+    stock_count: Optional[int] = None,
+    spot_long_only: bool = True,
+    focus_block_reason: Optional[str] = None,
+    tod_gate_enabled: Optional[bool] = None,
+    tod_custom_lock: bool = False,
+    stop_loss_profile: Optional[str] = None,
+    stop_loss_effective_pct: Optional[float] = None,
+    stop_loss_clamped: bool = False,
+    winning_formula: bool = False,
+    circuit_breaker_on: bool = False,
+    circuit_breaker_consec_losses: int = 0,
+    caps_locked: bool = False,
+    majors_only: Optional[bool] = None,
+    majors_symbols: Optional[Sequence[str]] = None,
 ) -> str:
-    """Layout order exact to archive §2 deep-dive — do not reorder."""
+    """Unified /status reply (Apex Signals Now) — same layout on Kraken + Coinbase.
+
+    Field order (operator layout):
+      Apex Signals Now {PAPER|LIVE} status
+      Last Scan Latency / last_tick_age / circuit breaker
+      cash=… / equity=… (+ WR)
+      pause=… (only when paused)
+      Market: …
+      caps=…
+      (blank)
+      winning_formula / Profile / tod_custom / stop_loss / Threshold / Spread
+      Target Setup / Entry Proximity / focus
+      positions
+      Universe / Symbols
+    """
+    from trading_bot.utils.entry_proximity import get_entry_threshold, make_progress_bar
+
+    _ = pid  # intentionally unused
+    thresh_pct = int(round(float(
+        entry_threshold if entry_threshold is not None else get_entry_threshold()
+    )))
+
+    nl = chr(10)
     mode = "PAPER" if paper else "LIVE"
-    lines: List[str] = [f"Apex Signals Now {mode} status", ""]
-    if last_scan_ms is not None and last_scan_n is not None:
-        lines.append(f"Last Scan Latency: {last_scan_ms:.0f}ms across {last_scan_n} pairs")
-    if last_tick_age is not None:
-        lines.append(f"last_tick_age={last_tick_age}")
+    pause_s = "PAUSED (no new buys)" if paused else "running"
+    if last_tick_age_seconds is None:
+        tick_s = "n/a"
+    else:
+        tick_s = f"{float(last_tick_age_seconds):.1f}s"
+
+    # Win rate block — big on the right of cash/equity/pause (paper session)
+    wr_big = ""
+    wr_sub = ""
+    if paper:
+        w = int(session_wins or 0)
+        l = int(session_losses or 0)
+        if win_rate_pct is not None:
+            wr_big = f"WR {float(win_rate_pct):.0f}%"
+            wr_sub = f"{w}W/{l}L"
+        elif (w + l) > 0:
+            wr_big = f"WR {100.0 * w / (w + l):.0f}%"
+            wr_sub = f"{w}W/{l}L"
+        else:
+            wr_big = "WR —"
+            wr_sub = "0W/0L"
+
+    def _row(left: str, right: str = "", width: int = 36) -> str:
+        if not right:
+            return left
+        # keep right edge readable on mobile Telegram
+        gap = max(2, width - len(left) - len(right))
+        return f"{left}{' ' * gap}{right}"
+
+    # --- header + scan health (top) ---
+    lines = [
+        f"Apex Signals Now {mode} status",
+        "",
+    ]
+    _ = strategy_mode  # kept for call-site compat; not shown on /status
+    if last_scan_latency_ms is not None:
+        try:
+            lat = max(0.0, float(last_scan_latency_ms))
+            pairs = int(last_scan_pair_count) if last_scan_pair_count is not None else 0
+            if pairs <= 0 and symbols:
+                pairs = len(list(symbols))
+            if abs(lat - round(lat)) < 0.05:
+                lat_s = f"{int(round(lat))}ms"
+            else:
+                lat_s = f"{lat:.1f}ms"
+            lines.append(f"Last Scan Latency: {lat_s} across {pairs} pairs")
+        except (TypeError, ValueError):
+            pass
+    lines.append(f"last_tick_age={tick_s}")
+    lines.append("")  # space between tick age and circuit breaker
+    cb_state = "ON" if circuit_breaker_on else "OFF"
+    try:
+        cl = max(0, int(circuit_breaker_consec_losses))
+    except (TypeError, ValueError):
+        cl = 0
+    # Telegram bots cannot set font color; 🔴 is the supported "red" cue
+    lines.append(
+        f"(⚠️☣️circuit breaker ☣️⚠️) {cb_state} · {cl} consecutive loss"
+        f"{'' if cl == 1 else 'es'}"
+    )
     lines.append("")
     lines.append("")
-    wr = (wins / (wins + losses) * 100.0) if (wins + losses) else 0.0
-    lines.append(f"cash=${cash:,.2f}")
-    lines.append(f"equity=${equity:,.2f}")
-    lines.append(f"WR {wr:.0f}% · {wins}W/{losses}L")
+
+    # --- cash / equity / WR (WR on its own line — Telegram fonts break right-align) ---
+    lines.append(f"cash=${float(paper_cash):.2f}")
+    lines.append(f"equity=${float(paper_equity):.2f}")
+    if wallet_b4 is not None:
+        try:
+            lines.append(f"💳 Wallet B4=${float(wallet_b4):.2f}")
+        except (TypeError, ValueError):
+            pass
+    if paper and (wr_big or wr_sub):
+        wr_bits = [b for b in (wr_big, wr_sub) if b]
+        lines.append(" · ".join(wr_bits) if wr_bits else "WR —")
     if paused:
-        lines.append("pause=PAUSED (new buys skipped; exits still managed)")
+        lines.append(f"pause={pause_s}")
     lines.append("")
-    mkt = f"Market: {market_label}"
-    if short_bias:
-        mkt += "  bias=SHORT"
-    lines.append(mkt)
-    lines.append(f"caps=${max_trade:.0f}/trade ${max_exposure:.0f} exposure")
+
+    # --- market + caps ---
+    ms_raw = str(market_state or "").strip()
+    if ms_raw:
+        ms_line = ms_raw
+        msu = ms_raw.upper()
+        if ("BEAR" in msu or "SHORT" in msu) and "BIAS=" not in msu:
+            ms_line = f"{ms_raw} bias=SHORT"
+        lines.append(f"Market: {ms_line}")
+    trade_c = (
+        f"${float(max_notional_per_trade):.0f}"
+        if max_notional_per_trade is not None
+        else "?"
+    )
+    exp_c = (
+        f"${float(max_total_exposure):.0f}"
+        if max_total_exposure is not None
+        else "?"
+    )
+    caps_line = f"caps={trade_c}/trade {exp_c} exposure"
+    if caps_locked:
+        caps_line += " 🔒"
+    lines.append(caps_line)
+    lines.append("")  # space before profile block
+
+    # --- profile block ---
+    lines.append(format_winning_formula_status_line(enabled=bool(winning_formula)))
+    prof = (trade_profile or "").strip().lower()
+    if prof in ("aggressive", "medium", "low"):
+        lines.append(f"Profile: {prof.upper()}")
+    elif prof:
+        lines.append(f"Profile: {prof.upper()}")
+    else:
+        lines.append("Profile: MEDIUM")
+    if tod_gate_enabled is None:
+        tod_s = "n/a"
+    else:
+        tod_s = "ON" if bool(tod_gate_enabled) else "OFF"
+        if tod_custom_lock:
+            tod_s += " 🔒"
+    lines.append(f"tod_custom: {tod_s}")
+    lines.append(format_stop_loss_status_line(
+        stop_loss_profile or "medium",
+        effective_sl_pct=stop_loss_effective_pct,
+        clamped=bool(stop_loss_clamped),
+    ))
+    lines.append(f"Threshold: {thresh_pct}%")
+    if max_spread_pct is not None:
+        try:
+            spread_pct_display = float(max_spread_pct) * 100.0
+            spread_s = f"{spread_pct_display:.4f}".rstrip("0").rstrip(".")
+            lines.append(f"Spread cap: {spread_s}%")
+        except (TypeError, ValueError):
+            lines.append("Spread cap: n/a")
+    else:
+        lines.append("Spread cap: n/a")
+
+
+
+    prox = entry_proximity if isinstance(entry_proximity, dict) else None
+
+    # Target Setup: LONG or WAIT only (Kraken spot — never SHORT).
+    direction = None
+    if prox is not None:
+        direction = str(prox.get("direction") or "").upper()
+    if direction not in ("LONG", "SHORT", "WAIT"):
+        raw = (target_setup or "").strip().upper()
+        if "SPOT MODE" in raw and "LONG" in raw:
+            direction = "LONG"
+        elif raw in ("LONG", "SHORT", "WAIT"):
+            direction = raw
+        elif "LONG" in raw.split():
+            direction = "LONG"
+        else:
+            direction = "WAIT"
+    if direction == "SHORT":
+        direction = "WAIT"
+    try:
+        thr = float(entry_threshold) if entry_threshold is not None else float(get_entry_threshold())
+    except Exception:
+        thr = 60.0
+    ms = str(market_state or "").upper()
+    bearish = ("BEAR_CHOP" in ms or "BIAS=SHORT" in ms or ms == "SHORT")
+    if spot_long_only and bearish:
+        thr = thr * 1.10
+    try:
+        score_now = float((prox or {}).get("score") or 0.0) if prox else 0.0
+    except (TypeError, ValueError):
+        score_now = 0.0
+    if direction == "LONG" and score_now < thr:
+        direction = "WAIT"
+    if direction not in ("LONG", "WAIT"):
+        direction = "WAIT"
+
     lines.append("")
-    lines.append(f"winning_formula: {'ON 🚀' if winning_formula else 'OFF'}")
-    lines.append(f"Profile: {trade_profile.upper()}")
-    lines.append(f"tod_custom: {tod_custom}")
-    lines.append(f"stop_loss: {stop_loss_line}")
-    thresh_line = f"Threshold: {threshold:.0f}%"
-    if threshold_note:
-        thresh_line += f" {threshold_note}"
-    lines.append(thresh_line)
-    lines.append(f"Spread cap: {spread_cap * 100:.2f}%")
+    if direction == "LONG" and spot_long_only:
+        lines.append("Target Setup: LONG (Spot Mode)")
+    else:
+        lines.append(f"Target Setup: {direction}")
+
+    if prox is not None:
+        try:
+            score = float(prox.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+    else:
+        score = 0.0
+    score = max(0.0, min(100.0, score))
+    raw_bar = prox.get("bar") if prox is not None else None
+    if isinstance(raw_bar, str) and raw_bar.startswith("[") and raw_bar.endswith("]"):
+        bar = raw_bar
+    elif isinstance(raw_bar, str) and raw_bar:
+        bar = f"[{raw_bar}]"
+    else:
+        bar = f"[{make_progress_bar(score)}]"
+    lines.append(f"Entry Proximity: {bar} {score:.1f}%")
+
+    focus_sym = focus_symbol
+    focus_px = focus_price
+    if prox is not None:
+        if not focus_sym:
+            focus_sym = prox.get("symbol")
+        if focus_px is None:
+            focus_px = prox.get("price")
+    if focus_sym:
+        try:
+            px = float(focus_px) if focus_px is not None else None
+        except (TypeError, ValueError):
+            px = None
+        if px is not None and px > 0:
+            focus_line = f"focus={focus_sym} @ ${_tg_fmt_price(px)}"
+        else:
+            focus_line = f"focus={focus_sym}"
+        if direction == "WAIT" and score >= 100.0 - 1e-9:
+            reason = (focus_block_reason or "").strip() or "entries frozen"
+            focus_line += f" [BLOCKED: {reason}]"
+        lines.append(focus_line)
+    else:
+        lines.append("focus=n/a")
+
     lines.append("")
-    lines.append(f"Target Setup: {target_setup}")
-    lines.append(f"Entry Proximity: {proximity_bar(proximity_score, proximity_threshold)}")
-    if focus:
-        lines.append(focus)
+    if not positions:
+
+        lines.append("positions: (none)")
+    else:
+        lines.append(f"positions ({len(positions)}):")
+        for p in positions:
+            # Each open position is a self-contained block: symbol + own bar +
+            # entry + PnL. Never share bar/score state across symbols.
+            sym = p.get("symbol") or "?"
+            try:
+                qty = float(p.get("qty") or 0)
+            except (TypeError, ValueError):
+                qty = 0.0
+            entry = p.get("avg_entry_price")
+            mv = p.get("market_value")
+            upl = p.get("unrealized_pl")
+            side = str(p.get("side") or "long").lower()
+            tp = p.get("take_profit")
+            mark = p.get("mark_price")
+            if mark is None and entry is not None and qty and mv is not None:
+                try:
+                    mark = float(mv) / abs(float(qty))
+                except (TypeError, ValueError, ZeroDivisionError):
+                    mark = None
+
+            # Unrealized PnL $ / %
+            try:
+                upl_f = float(upl) if upl is not None else None
+            except (TypeError, ValueError):
+                upl_f = None
+            if upl_f is None and entry is not None and mark is not None and qty:
+                try:
+                    e = float(entry)
+                    m = float(mark)
+                    if side == "short":
+                        upl_f = (e - m) * abs(float(qty))
+                    else:
+                        upl_f = (m - e) * abs(float(qty))
+                except (TypeError, ValueError):
+                    upl_f = None
+            pnl_pct = None
+            try:
+                if upl_f is not None and entry is not None and abs(float(qty)) > 0:
+                    cost = abs(float(entry) * float(qty))
+                    if cost > 0:
+                        pnl_pct = 100.0 * float(upl_f) / cost
+            except (TypeError, ValueError):
+                pnl_pct = None
+            if pnl_pct is None:
+                try:
+                    raw_pct = p.get("pnl_pct")
+                    if raw_pct is not None:
+                        pnl_pct = float(raw_pct)
+                except (TypeError, ValueError):
+                    pnl_pct = None
+
+            # Progress = current_pnl_pct / tp_target_pct * 100 (tp floor 2%).
+            # 100% ≈ +2% gross on a $500 ticket (~+$10 before fees).
+            progress = None
+            sl = p.get("stop_loss")
+            try:
+                e = float(entry) if entry is not None else 0.0
+                m = float(mark) if mark is not None else 0.0
+                if e > 0 and m > 0:
+                    if side == "short":
+                        cur_pnl_pct = (e - m) / e
+                    else:
+                        cur_pnl_pct = (m - e) / e
+                    tp_target_pct = 0.02
+                    if tp is not None and abs(float(tp) - e) > 1e-12:
+                        if side == "short":
+                            tp_target_pct = max(0.02, (e - float(tp)) / e)
+                        else:
+                            tp_target_pct = max(0.02, (float(tp) - e) / e)
+                    progress = 100.0 * cur_pnl_pct / tp_target_pct
+            except (TypeError, ValueError, ZeroDivisionError):
+                progress = None
+            if progress is None and pnl_pct is not None:
+                progress = 100.0 * (float(pnl_pct) / 100.0) / 0.02
+            if progress is None:
+                progress = 0.0
+            progress = max(0.0, min(100.0, float(progress)))
+            bar = f"[{make_progress_bar(progress)}]"
+
+            if entry is None:
+                entry_s = "?"
+            else:
+                e = float(entry)
+                entry_s = f"${_tg_fmt_price(e)}"
+            mv_s = f"${float(mv):.2f}" if mv is not None else "?"
+            if upl_f is None:
+                pnl_s = "n/a"
+            else:
+                money = f"+${upl_f:.2f}" if upl_f >= 0 else f"-${abs(upl_f):.2f}"
+                if pnl_pct is None:
+                    pnl_s = money
+                else:
+                    pnl_s = f"{money} ({pnl_pct:+.2f}%)"
+            side_s = "SHORT" if side == "short" else "LONG"
+
+            if mark is None:
+                live_s = "?"
+            else:
+                m = float(mark)
+                live_s = f"${_tg_fmt_price(m)}"
+
+            lines.append("")
+            lines.append(f"  {sym}  ({side_s})")
+            lines.append(f"  Progress: {bar} {progress:.1f}%")
+            lines.append(f"  live={live_s}")
+            lines.append(f"  entry={entry_s}  pnl={pnl_s}")
+            lines.append(f"  qty={_tg_fmt_qty(qty)}  mv={mv_s}")
+
+    # Universe line + pair list (always last; keep elite regime / WR layout intact)
     lines.append("")
-    lines.append(positions_block)
-    lines.append("")
-    lines.append(f"Universe: {universe}")
-    return "\n".join(lines)
+    sym_list = [str(s) for s in symbols] if symbols is not None else []
+    lines.append(format_universe_line(symbol_mode, len(sym_list), stocks_enabled=universe_stocks, stocks_count=stock_count))
+    if universe_stocks is None:
+        # Preserve the legacy compact footer for callers that do not request
+        # stock-universe metadata (older integrations/tests).
+        lines.append("symbols=" + ",".join(sym_list))
+    else:
+        # Keep /status short — full list opens via ▼ Symbols inline button.
+        n = len(sym_list)
+        if n:
+            lines.append(f"Symbols: {n} pairs · tap ▼ to expand")
+        else:
+            lines.append("Symbols: (none) · tap ▼ to expand")
+
+    if majors_only is not None:
+        if majors_only:
+            maj_list = [str(s) for s in (majors_symbols or []) if s]
+            if maj_list:
+                lines.append("majors_only: ON (" + ",".join(maj_list) + ")")
+            else:
+                lines.append("majors_only: ON")
+        else:
+            lines.append("majors_only: OFF")
+
+    return nl.join(lines)
 
 
 def format_position_block(
@@ -1316,6 +1719,206 @@ def format_balance_reply(
         f"{label}=${avail:.2f}\n"
         f"equity=${float(equity):.2f}"
     )
+
+
+
+def day_trades_from_ledger(
+    db_path: Optional[str] = None,
+    *,
+    now: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """Build performance_report trade rows from today's SELL fills in paper_ledger."""
+    import sqlite3
+
+    path = Path(db_path) if db_path else Path(__file__).resolve().parents[1] / "data" / "paper_ledger.db"
+    if not path.exists():
+        return []
+    now_dt = now or datetime.now(_CT)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=_CT)
+    else:
+        now_dt = now_dt.astimezone(_CT)
+    day_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_ts = day_start.timestamp()
+
+    try:
+        conn = sqlite3.connect(str(path))
+        rows = list(
+            conn.execute(
+                "SELECT ts, kind, symbol, side, qty, price, notional, fee, pnl "
+                "FROM events WHERE ts >= ? AND kind IN ('BUY','SELL','FILL') ORDER BY id",
+                (start_ts,),
+            )
+        )
+        conn.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("day_trades_from_ledger failed: %s", exc)
+        return []
+
+    buys_by_sym: Dict[str, List[Dict[str, Any]]] = {}
+    trades: List[Dict[str, Any]] = []
+    for ts, kind, symbol, side, qty, price, notional, fee, pnl in rows:
+        side_u = (side or "").upper()
+        kind_u = (kind or "").upper()
+        is_buy = kind_u == "BUY" or side_u == "BUY"
+        is_sell = kind_u == "SELL" or side_u == "SELL"
+        try:
+            when = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            when = datetime.now(timezone.utc)
+        sym = str(symbol or "")
+        if is_buy and not is_sell:
+            buys_by_sym.setdefault(sym, []).append(
+                {
+                    "when": when,
+                    "cost": float(notional or 0) or (float(qty or 0) * float(price or 0)),
+                    "price": float(price or 0),
+                    "qty": float(qty or 0),
+                }
+            )
+            continue
+        if is_sell:
+            cost = 0.0
+            pending = buys_by_sym.get(sym) or []
+            if pending:
+                b = pending.pop(0)
+                cost = float(b.get("cost") or 0)
+            exit_n = float(notional or 0) or (float(qty or 0) * float(price or 0))
+            trades.append(
+                {
+                    "when": when,
+                    "symbol": sym,
+                    "cost": cost,
+                    "exit": exit_n,
+                    "pnl": float(pnl or 0),
+                }
+            )
+    return trades
+
+
+def format_performance_report(
+    *,
+    trades: Sequence[Dict[str, Any]],
+    cash: float,
+    equity: float,
+    paper: bool = True,
+    now: Optional[datetime] = None,
+) -> str:
+    """📊 CRUZBOT PERFORMANCE REPORT — production /pnl table layout."""
+    now_dt = now or datetime.now(_CT)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=_CT)
+    else:
+        now_dt = now_dt.astimezone(_CT)
+    date_s = now_dt.strftime("%m/%d/%Y")
+    sep = "---------------------------------"
+    lines = [
+        "📊 CRUZBOT PERFORMANCE REPORT",
+        f"Date: {date_s}",
+        sep,
+        "Date/Time | Symbol | Cost | Exit | Net P&L",
+        sep,
+    ]
+
+    def money(x: float) -> str:
+        return f"+${x:,.2f}" if x >= 0 else f"-${abs(x):,.2f}"
+
+    def money_plain(x: float) -> str:
+        return f"${x:,.2f}"
+
+    day_net = 0.0
+    wins = 0
+    losses = 0
+    for t in trades:
+        when = t.get("when")
+        if isinstance(when, datetime):
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            when_ct = when.astimezone(_CT)
+            try:
+                when_s = when_ct.strftime("%-I:%M %p")
+            except ValueError:
+                when_s = when_ct.strftime("%I:%M %p").lstrip("0")
+        else:
+            when_s = str(when or "?")
+        sym = str(t.get("symbol") or "?")
+        cost = float(t.get("cost") or 0)
+        exit_v = float(t.get("exit") or 0)
+        pnl = float(t.get("pnl") or 0)
+        day_net += pnl
+        if pnl > 0:
+            wins += 1
+        else:
+            losses += 1
+        lines.append(
+            f"{when_s:<8} | {sym:<8} | {money_plain(cost)} | {money_plain(exit_v)} | {money(pnl)}"
+        )
+    lines.append(sep)
+    total = len(trades)
+    if total:
+        wr = 100.0 * wins / total
+        wr_s = f"{wr:.0f}% ({wins}W / {losses}L)"
+    else:
+        wr_s = "— (0W / 0L)"
+    bank_label = "Paper Bankroll" if paper else "Live Bankroll"
+    lines.append(f"• Total Trades: {total}")
+    lines.append(f"• Win Rate: {wr_s}")
+    lines.append(f"• Day Net P&L: {money(day_net)}")
+    lines.append(f"• {bank_label}: ${float(cash):,.2f} | ${float(equity):,.2f}")
+    return "\n".join(lines)
+
+
+def closed_trades_to_day_rows(
+    closed: Sequence[Dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """Map paper-book closed_trades into performance_report rows (today only)."""
+    now_dt = now or datetime.now(_CT)
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=_CT)
+    else:
+        now_dt = now_dt.astimezone(_CT)
+    day_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    out: List[Dict[str, Any]] = []
+    for t in closed or []:
+        raw_when = t.get("closed_at") or t.get("when") or t.get("ts")
+        when: Optional[datetime] = None
+        if isinstance(raw_when, datetime):
+            when = raw_when
+        elif isinstance(raw_when, (int, float)):
+            try:
+                when = datetime.fromtimestamp(float(raw_when), tz=timezone.utc)
+            except (TypeError, ValueError, OSError):
+                when = None
+        elif isinstance(raw_when, str) and raw_when:
+            try:
+                when = datetime.fromisoformat(raw_when.replace("Z", "+00:00"))
+            except ValueError:
+                when = None
+        if when is None:
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        when_ct = when.astimezone(_CT)
+        if when_ct < day_start:
+            continue
+        qty = float(t.get("qty") or 0)
+        entry = float(t.get("entry") or 0)
+        exit_px = float(t.get("exit") or t.get("price") or 0)
+        cost = abs(qty * entry)
+        exit_n = abs(qty * exit_px)
+        out.append(
+            {
+                "when": when,
+                "symbol": str(t.get("symbol") or "?"),
+                "cost": cost,
+                "exit": exit_n,
+                "pnl": float(t.get("pnl") or 0),
+            }
+        )
+    return out
+
 
 
 def recent_trades_from_ledger(

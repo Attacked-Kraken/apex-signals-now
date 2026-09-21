@@ -17,6 +17,10 @@ class OpsState:
     kill_requested: bool = False
     cb_enabled: bool = True  # master switch (losses always counted)
     cb_active: bool = False  # True while CB pause is in effect
+    cb_auto_resume_armed: bool = False
+    cb_auto_resume_at: float = 0.0
+    cb_win_since_trip: bool = False
+    CB_AUTO_RESUME_COOLDOWN_SEC: float = 45 * 60
     last_scan_ms: Optional[float] = None
     last_scan_n: Optional[int] = None
     last_tick_ts: float = field(default_factory=time.time)
@@ -35,13 +39,38 @@ class OpsState:
     def set_pause(self, value: bool) -> None:
         self.paused = bool(value)
         if not self.paused:
-            self.cb_active = False
+            self.clear_cb_auto_resume()
+
+    def arm_cb_auto_resume(self, cooldown_sec: float | None = None) -> int:
+        cd = float(cooldown_sec if cooldown_sec is not None else self.CB_AUTO_RESUME_COOLDOWN_SEC)
+        self.cb_auto_resume_armed = True
+        self.cb_auto_resume_at = time.monotonic() + max(60.0, cd)
+        self.cb_win_since_trip = False
+        self.cb_active = True
+        return int(round(cd / 60.0))
+
+    def clear_cb_auto_resume(self) -> None:
+        self.cb_auto_resume_armed = False
+        self.cb_auto_resume_at = 0.0
+        self.cb_win_since_trip = False
+        self.cb_active = False
+
+    def cb_auto_resume_ready(self, *, regime_bull_ok: bool) -> bool:
+        if not self.cb_auto_resume_armed or not self.paused:
+            return False
+        if time.monotonic() < float(self.cb_auto_resume_at or 0.0):
+            return False
+        return bool(self.cb_win_since_trip) or bool(regime_bull_ok)
+
 
     def touch_tick(self) -> None:
         self.last_tick_ts = time.time()
 
+    def tick_age_seconds(self) -> float:
+        return max(0.0, time.time() - self.last_tick_ts)
+
     def tick_age(self) -> str:
-        age = time.time() - self.last_tick_ts
+        age = self.tick_age_seconds()
         if age < 60:
             return f"{age:.0f}s"
         return f"{age/60:.1f}m"

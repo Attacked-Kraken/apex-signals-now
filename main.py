@@ -53,7 +53,6 @@ from trading_bot.telegram_commands import (
     format_circuity_breaker_status,
     format_history_reply,
     format_ping_reply,
-    format_position_block,
     format_positions_reply,
     format_reset_paper_done_reply,
     format_reset_paper_pending_reply,
@@ -85,6 +84,15 @@ logger = logging.getLogger("apex.main")
 _WF_BEAR_SL_MAX = 0.0125
 _WF_BEAR_MAX_RISK_USD = 6.0
 _WF_BEAR_REF_NOTIONAL = 500.0
+_HWM_PEAK_ARM_PCT = 0.012
+_HWM_FLOOR_PCT = 0.0125
+_HWM_PROGRESS_ARM = 60.0
+_TRAIL_RUNNER_ARM_PCT = 0.025
+_TRAIL_RUNNER_PROGRESS = 75.0
+_TRAIL_RUNNER_OFFSET_PCT = 0.01
+_TIME_EXIT_FEE_CUSHION_PCT = 0.0125
+_TIME_EXIT_MAKER_WAIT_SEC = 300.0
+MAJORS_ONLY_DEFAULT = ("BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD")
 ENV_PATH = ROOT / ".env"
 
 
@@ -123,7 +131,7 @@ class TradingApp:
         def _cb_pause(value: bool) -> None:
             self.ops.set_pause(value)
             if value:
-                self.ops.cb_active = True
+                self.ops.arm_cb_auto_resume()
 
         self.risk.set_ops(_cb_pause, lambda m: asyncio.create_task(self.notifier.send(m)))
         self.executor = Executor(self.broker, dry_run=self.dry_run, post_only=settings.post_only)
@@ -161,7 +169,7 @@ class TradingApp:
             floor = 65.0 if self.settings.winning_formula else 50.0
             return max(base * 1.10, floor)
         if self.settings.winning_formula:
-            return max(base, 50.0)
+            return max(base, 60.0)  # Tier-1 BULL floor
         return base
 
     def _wants_quick_scalp(self) -> bool:
@@ -210,7 +218,7 @@ class TradingApp:
 
     async def _check_hard_brackets(self) -> None:
         positions = await self.broker.get_positions()
-        fee_buf = float(self.settings.trail_fee_buffer_pct or 0.0085)
+        fee_buf = float(self.settings.trail_fee_buffer_pct or _HWM_FLOOR_PCT)
         arm = float(self.settings.elite_fee_lock_arm_pct or fee_buf)
         for pos in positions:
             ticker = await self.broker.get_ticker(pos.symbol)
@@ -233,8 +241,37 @@ class TradingApp:
                     sl = new_sl
                     await self.broker.update_position_brackets(pos.symbol, sl=sl)
 
-            # Trail after UPL >= fee buffer
-            if upl >= fee_buf and sl is not None:
+            # Peak tracking for HWM / profit-runner
+            peak_key = f"peak_upl:{pos.symbol}"
+            peak = float(self.ops.extra.get(peak_key) or 0.0)
+            peak = max(peak, upl)
+            self.ops.extra[peak_key] = peak
+
+            # HWM: peak ≥ +1.20% → SL floor +1.25% (never trail below)
+            if (not short) and peak >= _HWM_PEAK_ARM_PCT:
+                hwm_floor = pos.entry * (1.0 + _HWM_FLOOR_PCT)
+                if sl is None or sl < hwm_floor:
+                    sl = hwm_floor
+                    await self.broker.update_position_brackets(pos.symbol, sl=sl)
+
+            # Progress vs TP for runner arm
+            progress = 0.0
+            if tp is not None and pos.entry > 0 and not short:
+                tp_dist = (float(tp) - pos.entry) / pos.entry
+                if tp_dist > 1e-12:
+                    progress = 100.0 * upl / tp_dist
+
+            # Profit-runner trail: arm at ≥+2.50% UPL or 75% progress; 1% behind peak
+            runner_armed = (upl >= _TRAIL_RUNNER_ARM_PCT) or (progress >= _TRAIL_RUNNER_PROGRESS)
+            if runner_armed and not short:
+                trail_sl = mark * (1.0 - _TRAIL_RUNNER_OFFSET_PCT)
+                floor = pos.entry * (1.0 + _HWM_FLOOR_PCT) if peak >= _HWM_PEAK_ARM_PCT else pos.entry * (1.0 + fee_buf)
+                trail_sl = max(trail_sl, floor)
+                if sl is None or trail_sl > sl:
+                    sl = trail_sl
+                    await self.broker.update_position_brackets(pos.symbol, sl=sl)
+            elif upl >= fee_buf and sl is not None:
+                # Early fee-buffer trail (pre-runner)
                 trail_dist = max(0.004 * pos.entry, abs(mark - pos.entry) * 0.25)
                 if short:
                     candidate = mark + trail_dist
@@ -244,12 +281,14 @@ class TradingApp:
                 else:
                     candidate = mark - trail_dist
                     floor = pos.entry * (1.0 + fee_buf)
+                    if peak >= _HWM_PEAK_ARM_PCT:
+                        floor = max(floor, pos.entry * (1.0 + _HWM_FLOOR_PCT))
                     candidate = max(candidate, floor)
                     if candidate > (sl or 0):
                         sl = candidate
                         await self.broker.update_position_brackets(pos.symbol, sl=sl)
 
-            # SL / TP hits
+            # SL / TP hits (full exits only when tp1_fraction==0)
             hit = False
             reason = ""
             if sl is not None:
@@ -259,7 +298,7 @@ class TradingApp:
                 if (not short and mark >= tp) or (short and mark <= tp):
                     hit, reason = True, "TP"
 
-            # TIME_EXIT_MAKER_BE
+            # TIME_EXIT maker — only if gross ≥ +1.25%; wait 5 min
             if not hit and pos.opened_at and self.settings.max_hold_minutes > 0:
                 from datetime import datetime, timezone
 
@@ -269,21 +308,21 @@ class TradingApp:
                     opened = None
                 if opened is not None:
                     age_min = (datetime.now(timezone.utc) - opened).total_seconds() / 60.0
-                    if age_min >= self.settings.max_hold_minutes and -0.005 <= upl <= 0.008:
+                    if age_min >= self.settings.max_hold_minutes and upl >= _TIME_EXIT_FEE_CUSHION_PCT:
                         pending = self._pending_maker_time_exits.get(pos.symbol)
-                        be_px = pos.entry * (1.0 + float(self.settings.maker_fee_rate))
+                        be_px = pos.entry * (1.0 + _TIME_EXIT_FEE_CUSHION_PCT)
                         now = asyncio.get_event_loop().time()
                         if pending is None:
                             self._pending_maker_time_exits[pos.symbol] = {
                                 "be_px": be_px,
-                                "deadline": now + 180.0,
+                                "deadline": now + _TIME_EXIT_MAKER_WAIT_SEC,
                             }
                             logger.info("TIME_EXIT_MAKER_WAIT %s be=%.4f", pos.symbol, be_px)
                         else:
-                            if mark >= pending["be_px"]:
+                            if (not short and mark >= pending["be_px"]) or (short and mark <= pending["be_px"]):
                                 hit, reason = True, "TIME_EXIT_MAKER_BE"
                             elif now >= pending["deadline"]:
-                                if sl is not None and mark < sl:
+                                if sl is not None and ((not short and mark <= sl) or (short and mark >= sl)):
                                     hit, reason = True, "TIME_EXIT_MAKER_TIMEOUT_SL"
                                 else:
                                     logger.info("TIME_EXIT_MAKER_WAIT %s", pos.symbol)
@@ -401,7 +440,7 @@ class TradingApp:
 
         async def pnl(_c: str, _a: List[str]) -> str:
             bal = await self.broker.get_balances()
-            return self.notifier.performance_report(bal)
+            return self.notifier.performance_report(bal, paper=self.paper)
 
         async def kill(_c: str, _a: List[str]) -> str:
             await self.broker.cancel_all()
@@ -445,7 +484,18 @@ class TradingApp:
             trade, book = float(args[0]), float(args[1])
             object.__setattr__(self.settings, "max_notional_per_trade_usd", trade)
             object.__setattr__(self.settings, "max_total_exposure_usd", book)
-            return f"caps → ${trade:.0f}/trade ${book:.0f} exposure"
+            object.__setattr__(self.settings, "caps_custom_lock", True)
+            if ENV_PATH.exists():
+                from trading_bot.telegram_commands import _persist_env
+                _persist_env(
+                    ENV_PATH,
+                    {
+                        "MAX_NOTIONAL_PER_TRADE_USD": str(trade),
+                        "MAX_TOTAL_EXPOSURE_USD": str(book),
+                        "CAPS_CUSTOM_LOCK": "true",
+                    },
+                )
+            return f"caps → ${trade:.0f}/trade ${book:.0f} exposure 🔒"
 
         async def set_threshold(_c: str, args: List[str]) -> str:
             if not args:
@@ -892,68 +942,103 @@ class TradingApp:
         positions = await self.broker.get_positions()
         thresh, note = self._effective_entry_threshold()
         sl_pct, _tp, clamped = self._profile_sl_tp_pct()
-        preset = STOP_LOSS_PRESETS.get(self.settings.stop_loss_profile, STOP_LOSS_PRESETS["medium"])
-        sl_line = f"{preset['emoji']} {preset['label']} −{sl_pct*100:.2f}%"
-        if clamped:
-            sl_line += " (WF BEAR clamp)"
 
-        tod = "ON" if self.settings.tod_gate_enabled and not self.settings.disable_tod_gate else "OFF"
-        if self.settings.tod_custom_lock:
-            tod += " 🔒"
+        pos_rows = []
+        for p in positions:
+            tkr = await self.broker.get_ticker(p.symbol)
+            mark = float(tkr.get("mid") or p.entry)
+            upl = (mark - p.entry) * p.qty if p.side != "short" else (p.entry - mark) * p.qty
+            pos_rows.append(
+                {
+                    "symbol": p.symbol,
+                    "qty": p.qty,
+                    "avg_entry_price": p.entry,
+                    "mark_price": mark,
+                    "market_value": abs(p.qty * mark),
+                    "unrealized_pl": upl,
+                    "side": p.side,
+                    "stop_loss": p.sl,
+                    "take_profit": p.tp,
+                }
+            )
 
-        if self._short_bias():
-            target = "WAIT"
+        focus_sym = self.ops.focus_symbol or None
+        focus_px = None
+        if focus_sym:
+            tkr = await self.broker.get_ticker(focus_sym)
+            focus_px = float(tkr.get("mid") or 0) or None
+
+        market = self.regime.state.label or "n/a"
+        if self._short_bias() and "BIAS=" not in market.upper():
+            market = f"{market} bias=SHORT"
+
+        wins = int(bal.get("wins") or 0)
+        losses = int(bal.get("losses") or 0)
+        wr = (100.0 * wins / (wins + losses)) if (wins + losses) else None
+
+        try:
+            wallet_b4 = float(self.broker.paper_wallet_b4()) if self.paper else float(bal.get("equity") or 0)
+        except Exception:
+            wallet_b4 = float(getattr(self.settings, "account_equity", 0) or 0)
+
+        symbols = self.settings.symbol_list()
+        if getattr(self.settings, "majors_only", False):
+            majors = [s for s in MAJORS_ONLY_DEFAULT if s in symbols] or list(MAJORS_ONLY_DEFAULT)
+            status_symbols = majors
         else:
-            target = "LONG (Spot Mode)"
+            majors = list(MAJORS_ONLY_DEFAULT)
+            status_symbols = symbols
 
-        if positions:
-            blocks = []
-            for p in positions:
-                t = await self.broker.get_ticker(p.symbol)
-                mark = float(t.get("mid") or p.entry)
-                pnl = p.unrealized_pnl_pct(mark)
-                _, tp_pct, _ = self._profile_sl_tp_pct()
-                prog = min(100.0, max(0.0, (pnl / tp_pct) * 100.0)) if tp_pct else 0.0
-                blocks.append(format_position_block(p.symbol, p.entry, mark, p.qty, pnl, prog))
-            pos_block = "\n\n".join(blocks)
-        else:
-            pos_block = "positions: (none)"
+        tod_enabled = bool(self.settings.tod_gate_enabled) and not bool(self.settings.disable_tod_gate)
 
-        focus = ""
-        if self.ops.focus_symbol:
-            t = await self.broker.get_ticker(self.ops.focus_symbol)
-            px = float(t.get("mid") or 0)
-            focus = f"focus={self.ops.focus_symbol} @ ${px:,.2f}"
-            if self.ops.focus_blocked:
-                focus += f" [BLOCKED: {self.ops.focus_blocked}]"
+        entry_proximity = {
+            "score": float(self.ops.focus_score or 0.0),
+            "symbol": focus_sym,
+            "price": focus_px,
+            "direction": "WAIT" if self._short_bias() else ("LONG" if float(self.ops.focus_score or 0) >= thresh else "WAIT"),
+        }
 
         return format_status_reply(
-            paper=self.paper,
-            cash=float(bal["cash"]),
-            equity=float(bal["equity"]),
-            wins=int(bal["wins"]),
-            losses=int(bal["losses"]),
+            paper_cash=float(bal["cash"]),
+            paper_equity=float(bal["equity"]),
+            wallet_b4=wallet_b4,
+            positions=pos_rows,
             paused=self.ops.paused,
-            market_label=self.regime.state.label or "n/a",
-            short_bias=self._short_bias(),
-            max_trade=float(self.settings.max_notional_per_trade_usd),
-            max_exposure=float(self.settings.max_total_exposure_usd),
-            winning_formula=bool(self.settings.winning_formula),
+            strategy_mode=str(self.settings.strategy_mode or "volume_sweet_spot"),
+            last_tick_age_seconds=self.ops.tick_age_seconds(),
+            paper=self.paper,
+            symbols=status_symbols,
+            max_notional_per_trade=float(self.settings.max_notional_per_trade_usd),
+            max_total_exposure=float(self.settings.max_total_exposure_usd),
+            target_setup=entry_proximity["direction"],
+            entry_proximity=entry_proximity,
+            focus_symbol=focus_sym,
+            focus_price=focus_px,
+            entry_threshold=thresh,
+            max_spread_pct=float(self.settings.max_spread_pct),
             trade_profile=self.settings.trade_profile,
-            tod_custom=tod,
-            stop_loss_line=sl_line,
-            threshold=thresh,
-            threshold_note=note,
-            spread_cap=float(self.settings.max_spread_pct),
-            target_setup=target,
-            proximity_score=float(self.ops.focus_score),
-            proximity_threshold=thresh,
-            focus=focus,
-            positions_block=pos_block,
-            universe=self.settings.symbol_mode,
-            last_scan_ms=self.ops.last_scan_ms,
-            last_scan_n=self.ops.last_scan_n,
-            last_tick_age=self.ops.tick_age(),
+            last_scan_latency_ms=self.ops.last_scan_ms,
+            last_scan_pair_count=self.ops.last_scan_n,
+            market_state=market,
+            win_rate_pct=wr,
+            session_wins=wins,
+            session_losses=losses,
+            symbol_mode=self.settings.symbol_mode,
+            universe_stocks=bool(self.settings.universe_stocks),
+            stock_count=0,
+            spot_long_only=not bool(self.settings.allow_paper_shorts),
+            focus_block_reason=self.ops.focus_blocked or None,
+            tod_gate_enabled=tod_enabled,
+            tod_custom_lock=bool(self.settings.tod_custom_lock),
+            stop_loss_profile=self.settings.stop_loss_profile,
+            stop_loss_effective_pct=sl_pct,
+            stop_loss_clamped=clamped,
+            winning_formula=bool(self.settings.winning_formula),
+            circuit_breaker_on=bool(getattr(self.settings, "circuit_breaker_enabled", True)),
+            circuit_breaker_consec_losses=int(self.risk.consecutive_losses()),
+            caps_locked=bool(getattr(self.settings, "caps_custom_lock", False)),
+            majors_only=bool(getattr(self.settings, "majors_only", True)),
+            majors_symbols=majors,
         )
 
     async def start_telegram(self) -> Optional[asyncio.Task]:

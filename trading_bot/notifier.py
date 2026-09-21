@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from datetime import datetime
+from typing import Any, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -19,15 +20,40 @@ class Notifier:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("notify failed: %s", exc)
 
-    def performance_report(self, balances: dict) -> str:
-        cash = balances.get("cash", 0)
-        equity = balances.get("equity", 0)
-        wins = balances.get("wins", 0)
-        losses = balances.get("losses", 0)
-        day_start = balances.get("day_start_equity", equity)
-        day_pnl = equity - day_start
-        return (
-            f"Day P&L: ${day_pnl:+.2f}\n"
-            f"cash=${cash:,.2f} equity=${equity:,.2f}\n"
-            f"closed: {wins}W/{losses}L"
+    def performance_report(
+        self,
+        balances: dict,
+        *,
+        trades: Optional[Sequence[dict]] = None,
+        paper: bool = True,
+        now: Optional[datetime] = None,
+    ) -> str:
+        """Production CRUZBOT PERFORMANCE REPORT (/pnl)."""
+        from trading_bot.telegram_commands import (
+            closed_trades_to_day_rows,
+            day_trades_from_ledger,
+            format_performance_report,
         )
+
+        cash = float(balances.get("cash", 0) or 0)
+        equity = float(balances.get("equity", 0) or 0)
+        rows: List[dict]
+        if trades is not None:
+            rows = list(trades)
+        else:
+            rows = day_trades_from_ledger()
+            if not rows:
+                rows = closed_trades_to_day_rows(
+                    balances.get("closed_trades") or [], now=now
+                )
+        report = format_performance_report(
+            trades=rows, cash=cash, equity=equity, paper=paper, now=now
+        )
+        n = len(rows)
+        day_net = sum(float(t.get("pnl") or 0) for t in rows)
+        net_s = f"+${day_net:,.2f}" if day_net >= 0 else f"-${abs(day_net):,.2f}"
+        footer = (
+            f"Day P&L report sent ({n} closed). Net {net_s} | "
+            f"cash=${cash:,.2f} equity=${equity:,.2f}"
+        )
+        return report + "\n\n" + footer

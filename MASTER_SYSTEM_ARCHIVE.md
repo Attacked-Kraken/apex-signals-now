@@ -3,7 +3,32 @@
 > **Product (customer-facing):** Apex Signals Now  
 > **Internal checkout:** `cruzbot_instance_2` (Kraken paper Instance #2)  
 > **Purpose:** Self-contained cold-start archive so a new LLM/operator can reconstruct behavior from real code.  
-> **CRITICAL:** Never put real API keys, Telegram tokens, passwords, or secrets in this file. Use placeholders only.
+> **CRITICAL:** Never put real API keys, Telegram tokens, passwords, or secrets in this file. Use placeholders only.  
+> **Tier-1 lock date:** 2026-09-20 (CT) — Winning Formula institutional stack below is authoritative.
+
+---
+
+## 0. TIER-1 LOCKED STACK (CURRENT — READ FIRST)
+
+When `WINNING_FORMULA=true` (default ops mode), these knobs are **locked in code** (`execute_set_winning_formula` + `main.py` hard-bracket constants). Do not invent older fee/threshold values.
+
+| Knob | Value | Where |
+|------|-------|--------|
+| **Fees** | **0.80% taker / 0.40% maker** (RT **1.20%**) | `TAKER_FEE_RATE=0.008`, `MAKER_FEE_RATE=0.004` |
+| **HWM fee floor** | Peak gross UPL **≥ +1.20%** → SL floor **+1.25%** (never trail below) | `_HWM_PEAK_ARM_PCT=0.012`, `_HWM_FLOOR_PCT=0.0125`; `TRAIL_FEE_BUFFER_PCT=0.0125`, `ELITE_FEE_LOCK_ARM_PCT=0.012` |
+| **Time exit** | Maker limit **only if gross ≥ +1.25%** at `entry×1.0125`; wait **5 min** | `_TIME_EXIT_FEE_CUSHION_PCT=0.0125`, `_TIME_EXIT_MAKER_WAIT_SEC=300` |
+| **Partials** | **`TP1_FRACTION=0`** — full exits only on ~$500 tickets | WF apply + hard brackets |
+| **Entry threshold** | **BULL 60% / BEAR 65%** | WF sets `ENTRY_THRESHOLD=60`; `_bear_spot_long_threshold` floors BEAR to 65 |
+| **Profit-runner trail** | Arm at **≥ +2.50%** UPL **or 75%** progress; trail **1.00%** behind peak | `_TRAIL_RUNNER_ARM_PCT=0.025`, `_TRAIL_RUNNER_PROGRESS=75`, `_TRAIL_RUNNER_OFFSET_PCT=0.01` |
+| **Circuit breaker** | **3** consecutive losses → pause + **~45m** gated auto-resume; `/circuity_breaker_manually on\|off\|status` | `CIRCUIT_BREAKER_ENABLED`; OpsState CB |
+| **Weekly Digest 101** | `/weekly_digest_101 paper\|live` — paper expectancy wipeable; **live never wiped**; **return-only** (no double Telegram send) | `main._cmd_weekly_digest_101` |
+| **Wallet B4** | Shown on `/status` as `💳 Wallet B4=$…` | paper `broker.paper_wallet_b4()` or live bankroll |
+| **Live gate** | Paper-first; live only `/mode live` then `/confirm_live` (+ `PAPER_TRADING_MODE=false` + `python main.py --live`) | Telegram + CLI |
+| **Product name** | Customer-facing **Apex Signals Now**; internal path `cruzbot_instance_2` | `/status` header |
+
+**WF BEAR SL clamp (unchanged):** max SL **−1.25%** and **≤ $6 risk on $500** ref notional; TP ≈ `|sl|×1.5 + 0.80%` fee buffer. Max **1** concurrent position in BEAR/chop.
+
+**Activated reply (authoritative numbers):** fees 0.80%/0.40%, HWM +1.20%→+1.25%, time-exit maker ≥+1.25%, thresh **65% BEAR / 60% BULL**, circuit 3 losses · 45m gated auto-resume, TP1=0, post-only maker.
 
 ---
 
@@ -13,13 +38,13 @@
 Apex Signals Now Instance #2 is a **Python asyncio** paper/live trading engine focused on **Kraken spot** (`BROKER=kraken`), with **Telegram long-poll command control**, strategy mode **`volume_sweet_spot`**, and hard dollar risk caps.
 
 - **Paper (default):** `PAPER_TRADING_MODE=true`. `KrakenBroker` simulates fills locally (`kr-paper-…`); it does **not** call Kraken `AddOrder` / `CancelOrder` / `CancelAll` while paper is on.
-- **Live:** Requires `PAPER_TRADING_MODE=false` **and** `python main.py --live`, plus Telegram `/mode live` + `/confirm_live` (existing gating in `main.py`).
+- **Live:** Requires `PAPER_TRADING_MODE=false` **and** `python main.py --live`, plus Telegram `/mode live` + `/confirm_live`.
 - **Public market data / WS:** Kraken REST + WS ticker used for marks; optional Binance/Bybit lead-lag / CVD / liq feeds for gates.
 
 ### Stack (modules)
 | Role | Real path |
 |------|-----------|
-| Entry / loop / hard brackets / Telegram wiring | `main.py` (~6k lines) |
+| Entry / loop / hard brackets / Telegram wiring | `main.py` (~6k+ lines) |
 | Settings (pydantic-settings from `.env`) | `trading_bot/config.py` |
 | Kraken adapter | `trading_bot/brokers/kraken.py` |
 | Bars / indicators | `trading_bot/data_feed.py` |
@@ -41,13 +66,13 @@ Apex Signals Now Instance #2 is a **Python asyncio** paper/live trading engine f
 4. **SHORT bias effects (spot long-only, `ALLOW_PAPER_SHORTS=false`):**
    - Max concurrent positions → **1** (`_effective_max_concurrent`)
    - Spot still allows LONG evaluation (quality gate), not hard freeze
-   - Entry threshold floored / raised (see §3)
-   - WF BEAR SL clamp (see §3)
+   - Entry threshold floored / raised (see §0 / §3)
+   - WF BEAR SL clamp (see §0 / §3)
 
 ### Hard risk (code + instance)
 - **`MAX_TOTAL_EXPOSURE_USD=3000`** — **fixed dollar cap**, never equity-scaled (`risk_manager.py`).
-- **`MAX_NOTIONAL_PER_TRADE_USD`** — per-trade cap from Settings (instance `.env` often `1000`; profiles also set `1000`; WF BEAR **risk reference** uses **`$500`** notional for ≤`$6` dollar clamp).
-- Circuit breaker: **3** consecutive losses if `WINNING_FORMULA`, else **5** → `ops.set_pause(True)` + Telegram alert; clear with `/resume`.
+- **`MAX_NOTIONAL_PER_TRADE_USD`** — per-trade cap from Settings (WF ops often **~$500** tickets; profiles may use 1000). WF BEAR **risk reference** uses **`$500`** notional for ≤`$6` dollar clamp.
+- Circuit breaker: **3** consecutive losses if `WINNING_FORMULA` (else **5**) → pause + **~45m** gated auto-resume; Telegram `/circuity_breaker_manually`; clear pause with `/resume`.
 - Also: UTC-day **−3%** SQLite PnL circuit in strategy (`check_daily_drawdown_circuit`).
 
 ### Key paths (Instance #2)
@@ -60,20 +85,19 @@ cruzbot_instance_2/
   data/trading_bot_2.db         # SQLite (instance-isolated)
   data/active_params_2.json     # optimizer knobs
   data/trade_memory.json        # smart-memory outcomes
-  data/trades.db                # pair blacklist source
+  data/trades.db                # paper expectancy / blacklist (wipeable)
+  data/trades_live.db           # live fills history (never wiped by paper wipe)
 ```
 
 ### Locks / single poller
 - **Telegram getUpdates single-poller lock (REAL):**  
   `/tmp/cruzbot_tg_{bot_id}.lock` where `bot_id = token.split(":")[0]`  
-  Implemented in `TelegramCommandListener.run()` via `fcntl.flock(LOCK_EX|LOCK_NB)`. If lock held → listener stays **idle** (duplicate `/status` replies avoided).
-- **`/tmp/cruzbot_paper.lock`:** **Not present in current source.** Ops may use PID files such as `/tmp/cruzbot2_main.pid`; do not invent a paper flock that isn’t in code.
+  Implemented in `TelegramCommandListener.run()` via `fcntl.flock(LOCK_EX|LOCK_NB)`. If lock held → listener stays **idle**.
+- Ops may use PID files such as `/tmp/cruzbot2_main.pid`; do not invent a paper flock that isn’t in code.
 
 ### GOTCHA — shell env overrides `.env`
 `Settings` uses pydantic-settings with `env_file=.env`. **Process environment variables override `.env` file values.**  
-Telegram handlers that persist knobs also write `os.environ[...]` (e.g. WF sets `ENTRY_THRESHOLD=50`).  
-If a shell still has `ENTRY_THRESHOLD=35` (from `/aggressive`) when you expect WF 50/65, **the shell wins on next Settings load / until process env is corrected.**  
-WF `execute_set_winning_formula` and bare `/winning_formula` (while ON) explicitly force `os.environ["ENTRY_THRESHOLD"]="50"` to beat leftovers.
+WF `execute_set_winning_formula` and bare `/winning_formula` (while ON) explicitly force `os.environ["ENTRY_THRESHOLD"]="60"` to beat leftovers (e.g. `/aggressive` left `35`).
 
 ### Product naming
 - Telegram `/status` header: **`Apex Signals Now PAPER|LIVE status`**
@@ -85,10 +109,10 @@ WF `execute_set_winning_formula` and bare `/winning_formula` (while ON) explicit
 
 Source of truth: `KNOWN_COMMANDS` + `BOT_COMMAND_SPECS` in `trading_bot/telegram_commands.py`. Wired in `main.py` → `_wire_telegram_commands()`.
 
-### Full command list (`BOT_COMMAND_SPECS`)
+### Full command list (core)
 | Command | Description |
 |---------|-------------|
-| `/status` | PAPER/LIVE snapshot |
+| `/status` | PAPER/LIVE snapshot (incl. Wallet B4, circuit breaker line) |
 | `/pause` | Skip new buys |
 | `/resume` | Re-enable new buys |
 | `/pnl` | Day P&L report |
@@ -96,31 +120,22 @@ Source of truth: `KNOWN_COMMANDS` + `BOT_COMMAND_SPECS` in `trading_bot/telegram
 | `/mode` | Show/switch PAPER/LIVE |
 | `/confirm_live` | Confirm LIVE switch |
 | `/set_limit` | Update size caps |
-| `/set_threshold` | Entry threshold 15–95 |
-| `/set_threshold_custom` | Custom entry threshold 15–95 |
+| `/set_threshold` / `/set_threshold_custom` | Entry threshold 15–95 |
 | `/set_spread` | Max bid-ask spread % |
-| `/tod_custom` | TOD gate on/off (locks vs profiles) |
+| `/tod_custom` | TOD gate on/off |
 | `/stop_loss` | SL profile tight/medium/free |
 | `/winning_formula` | Winning formula on/off/status |
-| `/aggressive` `/medium` `/low` | Trade profiles |
-| `/profile` | Set aggressiveness profile |
+| `/circuity_breaker_manually` | CB on/off/status (3-loss / 45m) |
+| `/weekly_digest_101` | 7-day expectancy `paper\|live` |
+| `/aggressive` `/medium` `/low` `/profile` | Trade profiles |
 | `/test_trade` | Paper ~$100 BUY |
 | `/reset_paper` | Wipe paper book |
 | `/wipe_paper` / `/factory_reset` | Full paper scratch |
 | `/set` | Set knobs / profile alias |
-| `/ping` | Heartbeat latency |
-| `/positions` | Open positions |
-| `/balance` | Cash / equity |
-| `/history` | Last 5 trades |
-| `/grok` | Grok sentiment |
-| `/regime` | Market regime |
-| `/logs` | Tail paper log |
-| `/universe` | Crypto universe mode |
-| `/universe_all` | Kraken discovery |
-| `/universe_stocks` | Toggle xStocks |
-| `/symbols` | List active pairs |
-| `/close` | Close symbol (fee preview / confirm) |
-| `/clear_positions` | Paper close xStocks (or all) at BE |
+| `/ping` `/positions` `/balance` `/history` | Ops views |
+| `/grok` `/regime` `/logs` | Info |
+| `/universe` `/universe_all` `/universe_stocks` `/symbols` | Universe |
+| `/close` `/clear_positions` | Manual exits |
 | `/help` | Command list |
 
 Listener: only messages from `TELEGRAM_CHAT_ID`; long-poll `getUpdates`; `setMyCommands` registers menu.
@@ -134,87 +149,75 @@ Built by `format_status_reply()` — **layout order (do not reorder):**
 2. blank
 3. `Last Scan Latency: {ms} across {N} pairs` (if available)
 4. `last_tick_age=…`
-5. blank ×2
-6. `cash=$…` / `equity=$…` / `WR …% · nW/nL` (paper)
-7. `pause=PAUSED…` **only if paused**
-8. blank
-9. `Market: …` (+ `bias=SHORT` when BEAR/dump)
-10. `caps=$X/trade $Y exposure`
-11. blank
-12. Profile block:
-    - `winning_formula: ON 🚀` | `OFF`
-    - `Profile: AGGRESSIVE|MEDIUM|LOW`
-    - `tod_custom: ON|OFF` (+ 🔒 if custom lock)
-    - `stop_loss: {emoji} {LABEL} −{pct}%` (+ ` (WF BEAR clamp)` if clamped)
-    - `Threshold: {N}%` (pass **effective** thresh via `_bear_spot_long_threshold`; may append smart-memory note)
-    - `Spread cap: …%`
+5. blank
+6. `(⚠️☣️circuit breaker ☣️⚠️) ON|OFF · N consecutive loss(es)`
+7. blank ×2
+8. `cash=$…` / `equity=$…` / **`💳 Wallet B4=$…`** / `WR …% · nW/nL` (paper)
+9. `pause=PAUSED…` **only if paused**
+10. blank
+11. `Market: …` (+ `bias=SHORT` when BEAR/dump)
+12. `caps=$X/trade $Y exposure`
 13. blank
-14. `Target Setup: LONG (Spot Mode)` | `WAIT` (SHORT remapped to WAIT on spot)
-15. `Entry Proximity: [bar] score%`
-16. `focus=SYM @ $px` optional `[BLOCKED: …]`
-17. blank
-18. `positions: (none)` or per-position blocks (Progress bar, live, entry, pnl, qty, mv)
+14. Profile block: `winning_formula` / Profile / tod_custom / stop_loss / Threshold / Spread
+15. blank
+16. `Target Setup: LONG (Spot Mode)` | `WAIT`
+17. `Entry Proximity: [bar] score%`
+18. `focus=SYM @ $px` optional `[BLOCKED: …]`
 19. blank
-20. `Universe: …` + Symbols expand footer / inline ▼ button
-
-`main._cmd_status` injects market state, effective SL%, WF flag, smart-memory note on Threshold line.
+20. `positions: (none)` or per-position blocks
+21. blank
+22. `Universe: …` + Symbols expand footer
 
 ---
 
 ### Deep dive: `/winning_formula [on|off|status]`
-**Persistence keys:** `WINNING_FORMULA`, plus when ON: `ENTRY_THRESHOLD=50`, `MAX_CONCURRENT_POSITIONS=3`, `MIN_TP_PCT≈0.0305`, `TRAIL_FEE_BUFFER_PCT=0.012`, `ELITE_FEE_LOCK_ARM_PCT=0.012`, `TP1_FRACTION=0`, and forces `/stop_loss medium`.
+**Persistence keys when ON:** `WINNING_FORMULA=true`, `ENTRY_THRESHOLD=60`, `MAX_CONCURRENT_POSITIONS=3`, `MIN_TP_PCT≈0.0305`, `TRAIL_FEE_BUFFER_PCT=0.0125`, `ELITE_FEE_LOCK_ARM_PCT=0.012`, `TP1_FRACTION=0`, `TAKER_FEE_RATE=0.008`, `MAKER_FEE_RATE=0.004`, `CIRCUIT_BREAKER_ENABLED=true`, and forces `/stop_loss medium`.
 
-**Core implementation** (`execute_set_winning_formula`):
+**Core apply** (`execute_set_winning_formula`):
 
 ```python
-# trading_bot/telegram_commands.py (excerpt — real logic)
-
-_WF_SAVED_KEYS = (
-    "entry_threshold", "max_concurrent_positions", "min_tp_pct",
-    "atr_bracket_tp_min_pct", "trail_fee_buffer_pct", "elite_fee_lock_arm_pct",
-    "tp1_fraction", "stop_loss_profile",
-)
-
-def execute_set_winning_formula(settings, *, enabled, env_path, environ=None, signal_engine=None):
-    updates = {ENV_KEY_WINNING_FORMULA: "true" if enabled else "false"}
-    if enabled:
-        # save prior knobs on settings._winning_formula_saved
-        object.__setattr__(settings, "entry_threshold", 50.0)
-        apply_runtime_entry_threshold(settings, 50.0)
-        os.environ["ENTRY_THRESHOLD"] = "50"  # beat shell leftovers
-        object.__setattr__(settings, "max_concurrent_positions", 3)  # BEAR cap enforced live → 1
-        object.__setattr__(settings, "min_tp_pct", 0.0305)
-        object.__setattr__(settings, "trail_fee_buffer_pct", 0.012)   # trail arm ≥ +1.20%
-        object.__setattr__(settings, "elite_fee_lock_arm_pct", 0.012)
-        object.__setattr__(settings, "tp1_fraction", 0.0)             # full exits only
-        execute_set_stop_loss(settings, "medium", …)                 # auto SL → MEDIUM
-        # persist ENTRY_THRESHOLD, MAX_CONCURRENT_POSITIONS, MIN_TP_PCT,
-        # TRAIL_FEE_BUFFER_PCT, ELITE_FEE_LOCK_ARM_PCT, TP1_FRACTION
-    else:
-        # restore from _winning_formula_saved if present
-    object.__setattr__(settings, "winning_formula", bool(enabled))
+# trading_bot/telegram_commands.py — Tier-1 (Sep 2026)
+object.__setattr__(settings, "entry_threshold", 60.0)
+os.environ["ENTRY_THRESHOLD"] = "60"
+object.__setattr__(settings, "max_concurrent_positions", 3)  # BEAR → 1 live
+object.__setattr__(settings, "min_tp_pct", 0.0305)
+object.__setattr__(settings, "trail_fee_buffer_pct", 0.0125)   # +1.25% floor
+object.__setattr__(settings, "elite_fee_lock_arm_pct", 0.012)  # arm +1.20%
+object.__setattr__(settings, "tp1_fraction", 0.0)
+object.__setattr__(settings, "taker_fee_rate", 0.008)          # 0.80%
+object.__setattr__(settings, "maker_fee_rate", 0.004)          # 0.40%
+object.__setattr__(settings, "circuit_breaker_enabled", True)
+execute_set_stop_loss(settings, "medium", …)
 ```
 
-**Runtime effects (main.py, not only env):**
-- Auto SL → MEDIUM; BEAR clamp **max −1.25%** and **≤$6 on $500** ref notional
-- Threshold floors: **50% BULL / 65% BEAR** (via `_bear_spot_long_threshold`)
-- Trail arm **+1.20%**; full exits; maker time-exits; circuit **3** losses
-- Max **1** position in BEAR/chop (`_effective_max_concurrent`)
-- Rebrackets open positions via `_apply_profile_brackets`
-- **Bare `/winning_formula` while ON** (= status path): **re-applies** full formula + rebracket (fights `ENTRY_THRESHOLD=35` leftovers)
+**Runtime effects (`main.py`):**
+- Auto SL → MEDIUM; BEAR clamp **max −1.25%** and **≤$6 on $500**
+- Threshold floors: **60% BULL / 65% BEAR**
+- HWM: peak ≥ **+1.20%** → SL floor **+1.25%**
+- Time-exit maker only if gross ≥ **+1.25%**; 5m wait
+- Profit-runner trail: ≥ **+2.50%** or **75%** progress, **1.00%** offset
+- Full exits (`TP1=0`); circuit **3** losses / **45m** gated auto-resume
+- Max **1** position in BEAR/chop
+- Bare `/winning_formula` while ON **re-applies** full formula + rebracket
 
-**Activated reply** (`format_winning_formula_activated`):
-```
-🚀 WINNING FORMULA ACTIVATED
-• SL auto → 🟡 MEDIUM −1.50% / TP +2.25%
-• BEAR clamp: max SL −1.25% (≤$6 risk on $500)
-• BULL: full MEDIUM profile allowed
-• Threshold 65% BEAR / 50% BULL · max 1 pos in BEAR
-• Trail arm +1.20% · full exits · maker time-exits
-• Circuit: 3 consec losses or −3% daily DD
-```
+**Status / activated lines** document Tier-1 fees, HWM, time-exit, thresh, circuit (see §0). Note: one activated-string variant may still say “50% BULL” in an older format helper — **runtime + status helper use 60%**; prefer `/status` Threshold and env `ENTRY_THRESHOLD=60`.
 
-Boot: `_enforce_winning_formula_sl()` forces MEDIUM if WF already true in Settings.
+Boot: `_enforce_winning_formula_sl()` forces MEDIUM if WF already true; WF path also re-asserts HWM/trail/time-exit constants.
+
+---
+
+### Deep dive: `/circuity_breaker_manually [on|off|status]`
+- **on:** enable CB (`CIRCUIT_BREAKER_ENABLED=true`); if already at ≥limit losses, pause now + arm ~45m gated auto-resume
+- **off:** disable auto-pause (losses still counted); clear CB auto-resume arm; `/resume` if paused
+- **status:** `circuity_breaker_manually: ON|OFF · N consecutive losses · …`
+- Gated auto-resume: cooldown elapsed **and** (win since trip **or** `BULL_OK`)
+
+---
+
+### Deep dive: `/weekly_digest_101 [paper|live]`
+- **paper:** 7-day expectancy from wipeable paper DBs (`trades.db` / `trading_bot_2.db` memory). Cleared by `/wipe_paper`.
+- **live:** real fills via `broker.fetch_live_trades_history` / `trades_live.db` — **never wiped** by paper factory wipe.
+- Handler **returns body only** — TelegramCommandListener already replies; do **not** also `notifier.send` (no double send).
 
 ---
 
@@ -223,23 +226,13 @@ Boot: `_enforce_winning_formula_sl()` forces MEDIUM if WF already true in Settin
 
 ```python
 STOP_LOSS_PRESETS = {
-    "tight":  {"sl_pct": 0.0075, "sl_min_pct": 0.0075, "sl_max_pct": 0.0075,
-               "tp_pct": 0.0115, "atr_mult": 1.0, "emoji": "🔴",
-               "note": "Capital Preservation Active", "label": "TIGHT"},
-    "medium": {"sl_pct": 0.015,  "sl_min_pct": 0.015,  "sl_max_pct": 0.015,
-               "tp_pct": 0.0225, "atr_mult": 1.5, "emoji": "🟡",
-               "note": "Standard Room", "label": "MEDIUM"},
-    "free":   {"sl_pct": 0.025,  "sl_min_pct": 0.025,  "sl_max_pct": 0.030,
-               "tp_pct": 0.0375, "atr_mult": 2.5, "emoji": "🟢",
-               "note": "Wide Swing Room", "label": "FREE"},
+    "tight":  {"sl_pct": 0.0075, "tp_pct": 0.0115, "atr_mult": 1.0, "emoji": "🔴", "label": "TIGHT"},
+    "medium": {"sl_pct": 0.015,  "tp_pct": 0.0225, "atr_mult": 1.5, "emoji": "🟡", "label": "MEDIUM"},
+    "free":   {"sl_pct": 0.025,  "tp_pct": 0.0375, "atr_mult": 2.5, "emoji": "🟢", "label": "FREE"},
 }
 ```
 
-**`execute_set_stop_loss` persists:** `STOP_LOSS_PROFILE`, `SL_MIN_PCT`, `SL_MAX_PCT`, `ELITE_ATR_SL_MULT`, `MIN_TP_PCT`, `ATR_BRACKET_TP_MIN_PCT`; hot-applies on Settings + signal_engine.
-
-**Retroactive rebracket:** `main._cmd_stop_loss` walks open positions and calls `_apply_profile_brackets(sym, entry, qty=…, short=…)` so SL/TP update live.
-
-Aliases: `loose|wide|free` → free; `med|balanced` → medium; `t|red` → tight.
+Retroactive rebracket via `main._cmd_stop_loss` → `_apply_profile_brackets`.
 
 ---
 
@@ -253,29 +246,11 @@ async def _cmd_resume(...):
     self.ops.set_pause(False)
     return "Resumed: new buys enabled."
 ```
-Use `/resume` after circuit-breaker pause (3/5 consec losses). Exits keep running while paused.
+Use `/resume` after circuit-breaker pause. Exits keep running while paused.
 
 ---
 
-### Summaries of other commands
-| Cmd | Behavior / persistence |
-|-----|------------------------|
-| `/tod_custom on\|off` | Sets `TOD_GATE_ENABLED` / `DISABLE_TOD_GATE` / `TOD_CUSTOM_LOCK=true` so `/aggressive` won’t flip TOD |
-| `/set_threshold` / `_custom` | `ENTRY_THRESHOLD` 15–95; custom sets lock so profiles don’t overwrite |
-| `/aggressive` `/medium` `/low` | **Full override** via `TRADE_PROFILE_PRESETS`; clears WF + custom locks; sets thresh/spread/TOD/RVOL/caps |
-| `/set_limit <trade> <book>` | `MAX_NOTIONAL_PER_TRADE_USD`, `MAX_TOTAL_EXPOSURE_USD` |
-| `/pnl` | Day closed trades + notifier performance report |
-| `/positions` `/balance` `/history` | Paper book / ledger views |
-| `/close <sym>` | Fee preview then confirm close |
-| `/universe [all\|allowlist\|off]` | `SYMBOL_MODE` DYNAMIC_ALL / ALLOWLIST / OFF |
-| `/universe_stocks` | Toggle Kraken xStocks |
-| `/test_trade` | Paper-only ~$100 BUY |
-| `/reset_paper` `/wipe_paper` | Paper book reset (paper mode only) |
-| `/mode` `/confirm_live` | Paper↔live gating |
-| `/kill` | Cancel, flatten, stop loop |
-| `/regime` `/grok` `/logs` `/ping` `/help` | Info / ops |
-
-**Profile presets (REAL):**
+### Profile presets (REAL)
 ```python
 TRADE_PROFILE_PRESETS = {
   "aggressive": {entry_threshold:35, max_spread_pct:0.005, disable_tod_gate:True,
@@ -296,41 +271,41 @@ Note: `/aggressive` **turns WF off** (`WINNING_FORMULA=false`).
 
 ## 3. STRATEGY, REGIME & GUARDRAIL SPECIFICATIONS
 
-### Fee-aware trailing / fee_lock
-Constants (`utils/decision_filters.py`):
-- Default `FEE_BUFFER` / `TRAIL_FEE_BUFFER_PCT` ≈ **0.0085 (0.85%)**; computed band can rise toward **~0.90–1.20%** from maker/taker + 0.10% pad, clamped `[0.0085, 0.012]`.
-- WF sets buffer/arm to **0.012 (1.20%)**.
+### Fee-aware trailing / HWM / fee_lock (Tier-1)
+Constants (`main.py` + `utils/decision_filters.py`):
+- Tier-1 RT hurdle **1.20%** (0.80% + 0.40%); buffer/floor **1.25%**
+- `DEFAULT_TRAIL_FEE_BUFFER_PCT = 0.0125`
+- WF sets `trail_fee_buffer_pct=0.0125`, `elite_fee_lock_arm_pct=0.012`
 
 ```python
-def fee_lock_sl(entry, *, short=False, fee_buffer_pct=0.0085):
-    # long: entry * (1 + FEE_BUFFER); short: entry * (1 - FEE_BUFFER)
+# HWM (main._check_hard_brackets)
+_HWM_PEAK_ARM_PCT = 0.012   # peak ≥ +1.20%
+_HWM_FLOOR_PCT = 0.0125     # SL floor +1.25%
+_HWM_PROGRESS_ARM = 60.0
 
-def maybe_fee_lock_sl(entry, mark, current_sl, *, arm_pct=None, fee_buffer_pct=None, …):
-    # Arm only if UPL >= arm (and arm >= buffer). Raise long SL to fee floor.
+# Profit-runner (tight trail delayed)
+_TRAIL_RUNNER_ARM_PCT = 0.025      # +2.50%
+_TRAIL_RUNNER_PROGRESS = 75.0
+_TRAIL_RUNNER_OFFSET_PCT = 0.01    # 1% behind peak
 ```
 
-In `main._check_hard_brackets`:
-1. Elite fee-lock via `maybe_fee_lock_sl` when `wants_elite_risk`.
-2. Trail arms after UPL ≥ FEE_BUFFER; distance = `max(ATR14, 0.4% * entry)`.
-3. Floor: once UPL ≥ buffer, ensure `SL ≥ Entry * (1 + FEE_BUFFER)`.
+`maybe_fee_lock_sl`: arm when UPL ≥ buffer, progress ≥ 60%, or peak ≥ +1.20%; floor never trails below +1.25%.
 
-### TIME_EXIT_MAKER_BE
-When `max_hold_minutes` exceeded and UPL in **[−0.50%, +0.80%]** (and not negative-elite-blocked):
-- Arm pending maker BE: `be_px = entry * (1 + maker_fee_rate)` (default maker 0.5%).
-- Deadline **+180s (3 min)**.
-- If `mark >= be_px` → exit reason `TIME_EXIT_MAKER_BE` with limit at BE.
-- If timeout and `mark < SL` → `TIME_EXIT_MAKER_TIMEOUT_SL` (market/SL path).
-- Else wait (log `TIME_EXIT_MAKER_WAIT`).
+### TIME_EXIT maker (Tier-1)
+When `max_hold_minutes` exceeded:
+- Maker time-exit **only if** gross UPL **≥ +1.25%** (`_TIME_EXIT_FEE_CUSHION_PCT`)
+- Limit at `entry * 1.0125`; wait **300s (5 min)**
+- Reasons: `TIME_EXIT_MAKER_BE` / `TIME_EXIT_MAKER_TIMEOUT_SL` / wait logs
 
 ### BEAR / SHORT bias threshold floors
 ```python
 def _bear_spot_long_threshold(self, base: float) -> float:
     if spot_long_only and short_bias:
         floor = 65.0 if winning_formula else 50.0
-        return max(base * 1.10, floor)   # +10% score requirement
+        return max(b * 1.10, floor)
     if winning_formula:
-        return max(base, 50.0)           # BULL WF floor 50%
-    return base
+        return max(b, 50.0)  # WF sets base 60 → effective BULL 60%
+    return b
 ```
 
 ### WF BEAR SL clamp
@@ -338,46 +313,30 @@ def _bear_spot_long_threshold(self, base: float) -> float:
 _WF_BEAR_SL_MAX = 0.0125          # −1.25%
 _WF_BEAR_MAX_RISK_USD = 6.0
 _WF_BEAR_REF_NOTIONAL = 500.0
-
-# if WF and short_bias:
-#   sl = min(profile_sl, 0.0125, 6/ref_notional)
-#   tp = |sl| * 1.5 + 0.008   # 1.5 R:R + 0.80% fee buffer
-# elif WF:
-#   tp = |sl| * 1.5 + 0.008
+# tp ≈ |sl| * 1.5 + 0.008   # 1.5 R:R + 0.80% fee buffer
 ```
 
-### Circuit breaker (consec losses)
+### Circuit breaker
 ```python
 limit = 3 if winning_formula else 5
-if consecutive_losses() >= limit and not paused:
-    ops.set_pause(True)
-    notify: "⚠️ CIRCUIT BREAKER: {limit} consecutive losses … Use /resume"
+# trip → ops pause + ~45m gated auto-resume
+# /circuity_breaker_manually on|off|status
 ```
 Plus strategy daily DD: day SQLite PnL ≤ −3% of day-start equity → block new entries.
 
 ### Exposure / concurrent
-- `max_total = settings.max_total_exposure_usd` (**3000** fixed).  
-  Skip if `open_exposure + proposed_trade_cap > max_total`.
-- `_effective_max_concurrent()` → **1** if SHORT bias else `max_concurrent_positions` (WF sets 3, but BEAR forces 1).
+- `max_total = settings.max_total_exposure_usd` (**3000** fixed).
+- `_effective_max_concurrent()` → **1** if SHORT bias else `max_concurrent_positions` (WF sets 3, BEAR forces 1).
 
-### Smart memory (aggressive only)
-`adaptive_scalp.SmartMemory` on `data/trade_memory.json`:
-- Rolling last **5** outcomes; if winrate < **40%** → tighten threshold **35 → 55**.
-- **3** consecutive wins while tightened → restore **55 → 35**.
-- `/status` may show `Threshold: N% (smart-memory tightened (w/n wins))`.
-- Only applied when `wants_quick_scalp` (aggressive / thresh≤35).
-
-### Partial TP disabled under WF / small books
+### Partial TP disabled under WF
 - WF sets `tp1_fraction=0`.
-- Hard brackets allow TP1 only if `tp1_fraction > 0` **and** notional > `PARTIAL_TP_MAX_NOTIONAL_USD` (default 1000).  
-  Otherwise full exit at TP2 / profile TP / +2% progress logic.
+- Hard brackets allow TP1 only if `tp1_fraction > 0` **and** notional > `PARTIAL_TP_MAX_NOTIONAL_USD`. Otherwise full exit.
 
-### BTC regime vs macro regime (clarify naming)
+### BTC regime vs macro regime
 | Layer | States | File |
 |-------|--------|------|
 | BTC 15m EMA | `BEAR_CHOP`, `BULL_OK` (+ `dump_30m`) | `market_regime.py` |
-| Optimizer ATR+ADX | `TRENDING`, `RANGING` (`RANGE` alias), `HIGH_VOLATILITY` | `strategy.py` / `optimizer.py` |
-| HIGH_VOLATILITY gate | Block 5m retest BUYs; halve trade notional | strategy + settings `REGIME_GATE_ENABLED` |
+| Optimizer ATR+ADX | `TRENDING`, `RANGING`, `HIGH_VOLATILITY` | `strategy.py` / `optimizer.py` |
 
 ---
 
@@ -386,63 +345,25 @@ Plus strategy daily DD: day SQLite PnL ≤ −3% of day-start equity → block n
 ### Repo tree (key files under `cruzbot_instance_2`)
 ```
 cruzbot_instance_2/
-├── main.py                          # engine loop, brackets, Telegram handlers
+├── main.py
 ├── requirements.txt
 ├── pyproject.toml
 ├── .env / .env.example / .env.instance2.example
-├── INSTANCE_2_KRAKEN.md / ARCHITECTURE.md / PAPER_RUNBOOK.md
-├── data/
-│   ├── paper_book_2.json
-│   ├── trading_bot_2.db
-│   ├── active_params_2.json
-│   ├── trade_memory.json
-│   └── trades.db
-├── trading_bot/
-│   ├── config.py
-│   ├── telegram_commands.py
-│   ├── risk_manager.py
-│   ├── strategy_volume_sweet_spot.py
-│   ├── agent_core.py
-│   ├── market_regime.py
-│   ├── strategy.py                  # TRENDING/RANGING/HIGH_VOLATILITY
-│   ├── adaptive_scalp.py            # SmartMemory, micro-trail
-│   ├── data_feed.py
-│   ├── executor.py / notifier.py / models.py / state_store.py
-│   ├── structural_guardrails.py / scanner_auto_buy.py
-│   ├── brokers/kraken.py (+ coinbase, alpaca, mock, base)
-│   └── utils/decision_filters.py, entry_proximity.py, indicators.py, retry.py
-├── tests/ …                         # pytest suite
-├── scripts/ …                       # paper_session_status, telegram setup, …
-└── deploy/cruzbot2.service …
+├── MASTER_SYSTEM_ARCHIVE.md / README.md / ARCHITECTURE.md
+├── PAPER_RUNBOOK.md / INSTANCE_2_KRAKEN.md / HANDOFF.md
+├── EXPORT_SYSTEM_INSTRUCTIONS.md / STATUS.md
+├── data/          # runtime only — do not ship DBs in share zips
+├── trading_bot/   # package + brokers/ + utils/
+├── tests/
+├── scripts/
+└── deploy/        # systemd units, helpers (no runtime logs)
 ```
 
-### Name map (user shorthand → real files)
-| Requested name | Actual |
-|----------------|--------|
-| `config.py` | `trading_bot/config.py` |
-| `kraken_client.py` | `trading_bot/brokers/kraken.py` (+ `data_feed.py`) |
-| `strategy_engine.py` | `strategy_volume_sweet_spot.py` + `agent_core.py` + `market_regime.py` |
-| `risk_manager.py` | `trading_bot/risk_manager.py` + `utils/decision_filters.py` |
-| `telegram_bot.py` | `telegram_commands.py` + `main.py` wiring |
-
-### Critical code blocks (keep in sync with repo)
-
-**STOP_LOSS_PRESETS / execute_set_stop_loss / execute_set_winning_formula** — see §2 (full logic copied from `telegram_commands.py`).
-
-**`_profile_sl_tp_pct` / `_apply_profile_brackets` / `_bear_spot_long_threshold`** — see §3 (`main.py` ~2996–3070).
-
-**Exposure check** (`risk_manager.py`):
-```python
-max_total = float(self.settings.max_total_exposure_usd)  # fixed; never equity-scaled
-remaining = max_total - max(0.0, open_exposure_usd)
-proposed = float(self.settings.max_notional_per_trade_usd or 0)
-if remaining <= 0 or (proposed > 0 and open_exposure_usd + proposed > max_total):
-    return RiskVerdict(approved=False, reason="⛔ ENTRY SKIPPED: Max exposure cap …")
-```
-
-**Maker time-exit path** — see §3 (`main._check_hard_brackets` pending dict `_pending_maker_time_exits`, arm band −0.5%…+0.8%, 180s timeout).
-
-**Telegram lock** — `TelegramCommandListener.run()` flock on `/tmp/cruzbot_tg_{bot_id}.lock`.
+### Critical code blocks
+- **STOP_LOSS_PRESETS / execute_set_winning_formula / format_status_reply** — `telegram_commands.py`
+- **HWM / profit-runner / time-exit / CB** — `main.py` (`_check_hard_brackets`, `_cmd_circuity_breaker_manually`, `_cmd_weekly_digest_101`)
+- **Exposure** — `risk_manager.py` (fixed dollar cap)
+- **Telegram lock** — `TelegramCommandListener.run()` flock on `/tmp/cruzbot_tg_{bot_id}.lock`
 
 ### Dependencies (`requirements.txt`)
 ```
@@ -459,14 +380,8 @@ pytest-asyncio>=0.23.0
 coinbase-advanced-py>=1.8.0
 httpx>=0.27.0
 ```
-Instance ships a local `.venv` (Python 3.13 observed). Prefer:
-```bash
-cd /workspace/cruzbot_instance_2
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-```
 
-### Scrubbed `.env` template (Instance #2)
+### Scrubbed `.env` template (Instance #2 — Tier-1)
 ```bash
 # --- Mode ---
 PAPER_TRADING_MODE=true
@@ -484,7 +399,6 @@ KRAKEN_API_SECRET=YOUR_KRAKEN_API_SECRET
 KRAKEN_BASE_URL=https://api.kraken.com
 KRAKEN_WS_URL=wss://ws.kraken.com/v2
 
-# Leave unused brokers empty
 COINBASE_API_KEY=
 COINBASE_API_SECRET=
 
@@ -495,18 +409,21 @@ ACTIVE_PARAMS_PATH=data/active_params_2.json
 SQLITE_BACKUP_DIR=data/backups_2
 TRADES_DB_PATH=data/trades.db
 
-# --- Risk / strategy ---
+# --- Tier-1 Winning Formula / risk ---
 STRATEGY_MODE=volume_sweet_spot
-MAX_NOTIONAL_PER_TRADE_USD=1000
+MAX_NOTIONAL_PER_TRADE_USD=500
 MAX_TOTAL_EXPOSURE_USD=3000
 MAX_CONCURRENT_POSITIONS=3
-ENTRY_THRESHOLD=50
+ENTRY_THRESHOLD=60
 TRADE_PROFILE=medium
 STOP_LOSS_PROFILE=medium
 WINNING_FORMULA=true
-TRAIL_FEE_BUFFER_PCT=0.012
+TAKER_FEE_RATE=0.008
+MAKER_FEE_RATE=0.004
+TRAIL_FEE_BUFFER_PCT=0.0125
 ELITE_FEE_LOCK_ARM_PCT=0.012
 TP1_FRACTION=0
+CIRCUIT_BREAKER_ENABLED=true
 POST_ONLY=true
 ELITE_RISK_ENABLED=true
 BTC_REGIME_ENABLED=true
@@ -533,7 +450,7 @@ main.TradingApp
   ├─ BtcRegimeEngine ──► SHORT bias / BEAR_CHOP
   ├─ SymbolUniverse ──► allowlist / discovery / xStocks
   ├─ loop: scan symbols → proximity / strategy → risk → execute
-  ├─ _check_hard_brackets each tick (SL/TP/trail/fee-lock/time-exit)
+  ├─ _check_hard_brackets (SL/TP/HWM/profit-runner/time-exit)
   └─ TelegramCommandListener (single flock) → _cmd_* handlers
 ```
 
@@ -541,50 +458,47 @@ main.TradingApp
 
 ## OPERATING NOTES (brief)
 
-1. **Duplicate `main.py` PIDs break Telegram** — two pollers fight `getUpdates`; second loses flock and goes idle (or stale replies). Keep **one** Instance #2 process.
-2. **Clear `/tmp/cruzbot_tg_*.lock` on restart** if the listener logs idle while no healthy process holds the lock (stale flock after crash). Prefer killing the old PID first.
-3. **Never leave `ENTRY_THRESHOLD=35` in process env when WF wants 50/65** — shell overrides `.env`. After WF on, confirm `/status` Threshold and `os.environ["ENTRY_THRESHOLD"]`.
-4. Paper state lives in `data/paper_book_2.json` — backup before `/wipe_paper`.
+1. **Duplicate `main.py` PIDs break Telegram** — keep **one** Instance #2 process.
+2. **Clear `/tmp/cruzbot_tg_*.lock` on restart** only after confirming no healthy owner PID.
+3. **Never leave `ENTRY_THRESHOLD=35` in process env when WF wants 60/65** — shell overrides `.env`.
+4. Paper state: `data/paper_book_2.json` — backup before `/wipe_paper`. Live expectancy DB is separate and not wiped.
 5. Do not share SQLite/paper book with Instance #1 (Coinbase).
+6. Live: `/mode live` → `/confirm_live` only after explicit operator request.
 
 ---
 
 ## COLD-START REBOOT PROMPT
 
-Copy-paste the following to a new AI to recreate and run Instance #2 paper-first:
-
 ```
 You are rebuilding Apex Signals Now (internal: cruzbot_instance_2) — Kraken paper trading bot.
 
-READ FIRST: /workspace/cruzbot_instance_2/MASTER_SYSTEM_ARCHIVE.md (this archive).
-Then read real source under /workspace/cruzbot_instance_2 — do not invent features.
+READ FIRST: MASTER_SYSTEM_ARCHIVE.md §0 Tier-1 locked stack, then real source.
+Do not invent features or older fee tables (0.9%/0.5% is obsolete).
 
 CHECKLIST:
-1) Confirm tree: main.py, trading_bot/*, data/, requirements.txt, .env.instance2.example.
-2) Create scrubbed .env from archive §4 template:
+1) Tree: main.py, trading_bot/*, requirements.txt, .env.example
+2) Scrubbed .env from archive §4:
    - BROKER=kraken, PAPER_TRADING_MODE=true
    - PAPER_BOOK_PATH=data/paper_book_2.json, SQLITE_PATH=data/trading_bot_2.db
-   - Placeholders only: YOUR_KRAKEN_API_KEY, YOUR_KRAKEN_API_SECRET,
-     YOUR_TELEGRAM_BOT_TOKEN, YOUR_TELEGRAM_CHAT_ID, YOUR_XAI_API_KEY
-   - Risk: MAX_TOTAL_EXPOSURE_USD=3000, MAX_NOTIONAL_PER_TRADE_USD per ops (often 1000);
-     WINNING_FORMULA + STOP_LOSS_PROFILE=medium + ENTRY_THRESHOLD=50 as desired
+   - Placeholders: YOUR_KRAKEN_API_KEY, YOUR_KRAKEN_API_SECRET,
+     YOUR_TELEGRAM_BOT_TOKEN, YOUR_TELEGRAM_CHAT_ID
+   - Tier-1: WINNING_FORMULA=true, ENTRY_THRESHOLD=60,
+     TAKER_FEE_RATE=0.008, MAKER_FEE_RATE=0.004,
+     TRAIL_FEE_BUFFER_PCT=0.0125, ELITE_FEE_LOCK_ARM_PCT=0.012,
+     TP1_FRACTION=0, CIRCUIT_BREAKER_ENABLED=true,
+     MAX_TOTAL_EXPOSURE_USD=3000, STOP_LOSS_PROFILE=medium
 3) python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
-4) Unset conflicting shell exports (esp. ENTRY_THRESHOLD=35) before start:
-     unset ENTRY_THRESHOLD TRADE_PROFILE WINNING_FORMULA STOP_LOSS_PROFILE
-5) Ensure only one main.py for this instance. If Telegram idle:
-     rm -f /tmp/cruzbot_tg_*.lock  (only after confirming no live owner PID)
-6) Run paper:  python main.py
-   Smoke:      python main.py --once
-   Dry mock:   python main.py --dry-run --once
-7) Verify Telegram: /status shows "Apex Signals Now PAPER status", caps, WF/profile/stop_loss/threshold.
-8) Re-apply ops if needed: /winning_formula on   then   /status
-9) Never commit secrets. Never enable live without explicit operator request + /confirm_live.
+4) unset ENTRY_THRESHOLD TRADE_PROFILE WINNING_FORMULA STOP_LOSS_PROFILE
+5) One main.py only. Stale TG lock: rm -f /tmp/cruzbot_tg_*.lock (after PID check)
+6) Paper: python main.py
+7) /status → Apex Signals Now PAPER status, Wallet B4, CB line, WF ON, Threshold 60%/65% BEAR
+8) Ops: /winning_formula on · /circuity_breaker_manually status · /weekly_digest_101 paper
+9) Never commit secrets. Live only via /mode live + /confirm_live.
 
-Reconstruct any missing behavior from archive §2–§4 and the cited functions in
-telegram_commands.py / main.py / risk_manager.py / decision_filters.py /
-market_regime.py / adaptive_scalp.py / strategy_volume_sweet_spot.py.
+Reconstruct from telegram_commands.py / main.py / risk_manager.py /
+decision_filters.py / market_regime.py / strategy_volume_sweet_spot.py.
 ```
 
 ---
 
-*End of MASTER_SYSTEM_ARCHIVE.md — generated from live `cruzbot_instance_2` source. Prefer re-reading code if archive and tree diverge.*
+*End of MASTER_SYSTEM_ARCHIVE.md — Tier-1 refresh 2026-09-20 CT from live `cruzbot_instance_2` source. Prefer re-reading code if archive and tree diverge.*

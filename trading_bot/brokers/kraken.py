@@ -38,6 +38,7 @@ class KrakenBroker(BrokerBase):
         self.base_url = base_url.rstrip("/")
         self.paper = paper
         self.paper_book_path = Path(paper_book_path)
+        self.account_equity = float(account_equity)
         self.min_public_interval = min_public_interval
         self._last_public = 0.0
         self._client: Optional[httpx.AsyncClient] = None
@@ -53,6 +54,7 @@ class KrakenBroker(BrokerBase):
                     "closed_trades": [],
                     "consecutive_losses": 0,
                     "day_start_equity": float(equity),
+                    "wallet_b4": float(equity),
                     "updated_at": utcnow().isoformat(),
                 }
             )
@@ -312,11 +314,24 @@ class KrakenBroker(BrokerBase):
                 "closed_trades": [],
                 "consecutive_losses": 0,
                 "day_start_equity": float(equity),
+                "wallet_b4": float(equity),
                 "updated_at": utcnow().isoformat(),
             }
         )
 
-    def set_consecutive_losses(self, n: int) -> None:
+    
+    def paper_wallet_b4(self) -> float:
+        """Baseline paper bankroll shown as Wallet B4 on /status."""
+        book = self._read_book()
+        for key in ("wallet_b4", "day_start_equity", "cash"):
+            if key in book and book[key] is not None:
+                try:
+                    return float(book[key])
+                except (TypeError, ValueError):
+                    pass
+        return float(self.account_equity or 0)
+
+def set_consecutive_losses(self, n: int) -> None:
         book = self._read_book()
         book["consecutive_losses"] = int(n)
         self._write_book(book)

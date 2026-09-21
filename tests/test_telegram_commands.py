@@ -187,3 +187,145 @@ def test_handlers_cover_all_bot_command_specs():
                     wired.add(key)
     for cmd, _ in BOT_COMMAND_SPECS:
         assert cmd in wired, f"/{cmd} missing from main._wire_telegram_commands return dict"
+
+
+def test_format_status_production_substrings():
+    from trading_bot.telegram_commands import format_status_reply
+
+    text = format_status_reply(
+        paper_cash=1493.25,
+        paper_equity=2997.78,
+        wallet_b4=3000.0,
+        positions=[
+            {
+                "symbol": "LINK-USD",
+                "qty": 59.48,
+                "avg_entry_price": 12.62,
+                "mark_price": 12.67,
+                "market_value": 753.43,
+                "unrealized_pl": 3.06,
+                "side": "long",
+                "take_profit": 12.62 * 1.0225,
+            }
+        ],
+        paused=False,
+        strategy_mode="volume_sweet_spot",
+        last_tick_age_seconds=0.0,
+        paper=True,
+        symbols=["BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD"],
+        max_notional_per_trade=750,
+        max_total_exposure=3000,
+        entry_threshold=60,
+        max_spread_pct=0.002,
+        trade_profile="medium",
+        market_state="BULL_OK",
+        session_wins=0,
+        session_losses=0,
+        symbol_mode="ALLOWLIST",
+        universe_stocks=False,
+        tod_gate_enabled=False,
+        tod_custom_lock=True,
+        stop_loss_profile="medium",
+        winning_formula=True,
+        circuit_breaker_on=True,
+        circuit_breaker_consec_losses=0,
+        caps_locked=True,
+        majors_only=True,
+        majors_symbols=["BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD"],
+        entry_proximity={"score": 49.1, "direction": "WAIT", "symbol": "BTC-USD", "price": 81421.30},
+    )
+    for needle in (
+        "Apex Signals Now",
+        "Wallet B4",
+        "circuit breaker",
+        "winning_formula",
+        "Entry Proximity",
+        "positions (1):",
+        "LINK-USD",
+        "Progress:",
+        "majors_only: ON",
+    ):
+        assert needle in text, needle
+
+
+def test_performance_report_shape():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from trading_bot.telegram_commands import format_performance_report
+
+    ct = ZoneInfo("America/Chicago")
+    text = format_performance_report(
+        trades=[
+            {
+                "when": datetime(2026, 9, 21, 7, 32, tzinfo=ct),
+                "symbol": "LINK-USD",
+                "cost": 0.0,
+                "exit": 741.94,
+                "pnl": -14.41,
+            },
+            {
+                "when": datetime(2026, 9, 21, 8, 42, tzinfo=ct),
+                "symbol": "SOL-USD",
+                "cost": 750.37,
+                "exit": 765.85,
+                "pnl": 9.41,
+            },
+        ],
+        cash=1494.17,
+        equity=2999.45,
+        paper=True,
+        now=datetime(2026, 9, 21, 12, 0, tzinfo=ct),
+    )
+    assert "CRUZBOT PERFORMANCE REPORT" in text
+    assert "Date/Time | Symbol | Cost | Exit | Net P&L" in text
+    assert "Paper Bankroll" in text
+    assert "Total Trades: 2" in text
+
+
+def test_weekly_digest_paper_vs_live_empty(tmp_path):
+    from trading_bot.telegram_commands import build_weekly_expectancy_digest, parse_weekly_digest_args
+
+    assert parse_weekly_digest_args(["paper"]) == "paper"
+    assert parse_weekly_digest_args(["live"]) == "live"
+    # empty DBs → distinct mode footers
+    paper = build_weekly_expectancy_digest(mode="paper", root=tmp_path, days=7)
+    live = build_weekly_expectancy_digest(mode="live", root=tmp_path, days=7)
+    assert "Mode: PAPER" in paper
+    assert "Mode: LIVE" in live
+    assert "wipe" in paper.lower() or "Paper" in paper
+    assert "Live" in live or "live" in live.lower()
+
+
+def test_wf_tier1_defaults(tmp_path):
+    from types import SimpleNamespace
+    from trading_bot.telegram_commands import execute_set_winning_formula
+
+    settings = SimpleNamespace(
+        entry_threshold=40.0,
+        max_concurrent_positions=2,
+        min_tp_pct=0.02,
+        atr_bracket_tp_min_pct=0.02,
+        trail_fee_buffer_pct=0.01,
+        elite_fee_lock_arm_pct=0.01,
+        tp1_fraction=0.5,
+        stop_loss_profile="tight",
+        taker_fee_rate=0.01,
+        maker_fee_rate=0.01,
+        circuit_breaker_enabled=False,
+        winning_formula=False,
+        sl_min_pct=0.0075,
+        sl_max_pct=0.0075,
+        elite_atr_sl_mult=1.0,
+    )
+    env_path = tmp_path / ".env"
+    env_path.write_text("PAPER_TRADING_MODE=true\n")
+    environ = {}
+    reply = execute_set_winning_formula(settings, enabled=True, env_path=env_path, environ=environ)
+    assert settings.entry_threshold == 60.0
+    assert settings.trail_fee_buffer_pct == 0.0125
+    assert settings.elite_fee_lock_arm_pct == 0.012
+    assert settings.taker_fee_rate == 0.008
+    assert settings.maker_fee_rate == 0.004
+    assert settings.tp1_fraction == 0.0
+    assert settings.circuit_breaker_enabled is True
+    assert "0.80%" in reply or "Tier-1" in reply or "HWM" in reply

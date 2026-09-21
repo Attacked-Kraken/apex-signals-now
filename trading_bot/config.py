@@ -19,11 +19,8 @@ class Settings(BaseSettings):
     paper_trading_mode: bool = True
     dry_run: bool = False
     broker: str = "kraken"
-    account_equity: float = 1600.0
-    symbols: str = (
-        "BTC-USD,ETH-USD,SOL-USD,XRP-USD,LINK-USD,AVAX-USD,"
-        "SUI-USD,ADA-USD,DOGE-USD,DOT-USD,ATOM-USD,LTC-USD,UNI-USD,NEAR-USD"
-    )
+    account_equity: float = 3000.0
+    symbols: str = "BTC-USD,ETH-USD,SOL-USD,LINK-USD"
     symbol_mode: str = "ALLOWLIST"
     universe_stocks: bool = False
     allow_paper_shorts: bool = False
@@ -47,15 +44,15 @@ class Settings(BaseSettings):
 
     # Risk / strategy
     strategy_mode: str = "volume_sweet_spot"
-    max_notional_per_trade_usd: float = 1000.0
+    max_notional_per_trade_usd: float = 750.0
     max_total_exposure_usd: float = 3000.0  # fixed; never equity-scaled
     max_concurrent_positions: int = 3
-    entry_threshold: float = 50.0
+    entry_threshold: float = 60.0
     trade_profile: str = "medium"
     stop_loss_profile: str = "medium"
     winning_formula: bool = True
     circuit_breaker_enabled: bool = True
-    trail_fee_buffer_pct: float = 0.012
+    trail_fee_buffer_pct: float = 0.0125
     elite_fee_lock_arm_pct: float = 0.012
     tp1_fraction: float = 0.0
     post_only: bool = True
@@ -64,6 +61,8 @@ class Settings(BaseSettings):
     tod_gate_enabled: bool = True
     disable_tod_gate: bool = False
     tod_custom_lock: bool = False
+    caps_custom_lock: bool = False
+    majors_only: bool = True
     entry_threshold_custom_lock: bool = False
 
     # SL/TP (hot-applied by profiles)
@@ -76,7 +75,8 @@ class Settings(BaseSettings):
     rvol_breakout_mult: float = 2.0
     agent_poll_seconds: float = 30.0
     max_hold_minutes: float = 240.0
-    maker_fee_rate: float = 0.005
+    taker_fee_rate: float = 0.008
+    maker_fee_rate: float = 0.004
     partial_tp_max_notional_usd: float = 1000.0
     regime_gate_enabled: bool = True
 
