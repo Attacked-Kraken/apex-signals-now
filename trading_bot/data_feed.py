@@ -18,11 +18,12 @@ class DataFeed:
         self,
         base_url: str = "https://api.kraken.com",
         *,
-        min_interval: float = 0.4,
+        min_interval: float = 0.12,
     ):
         self.base_url = base_url.rstrip("/")
         self.min_interval = min_interval
         self._last = 0.0
+        self._lock = asyncio.Lock()
         self._client: Optional[httpx.AsyncClient] = None
         self._cache: Dict[str, Tuple[float, List[Dict[str, float]]]] = {}
 
@@ -41,11 +42,12 @@ class DataFeed:
             self._client = None
 
     async def _throttle(self) -> None:
-        now = time.monotonic()
-        wait = self.min_interval - (now - self._last)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        self._last = time.monotonic()
+        async with self._lock:
+            now = time.monotonic()
+            wait = self.min_interval - (now - self._last)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last = time.monotonic()
 
     def _pair(self, symbol: str) -> str:
         base, quote = symbol.replace("/", "-").split("-")
@@ -58,7 +60,7 @@ class DataFeed:
         cache_key = f"{symbol}:{interval}"
         now = time.time()
         hit = self._cache.get(cache_key)
-        if hit and now - hit[0] < 20:
+        if hit and now - hit[0] < 8:
             return hit[1]
 
         await self._throttle()

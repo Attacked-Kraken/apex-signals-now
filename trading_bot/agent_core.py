@@ -1,9 +1,10 @@
 """Scan orchestration — strategy + regime + risk gates."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from trading_bot.data_feed import DataFeed
 from trading_bot.models import Signal
@@ -23,6 +24,32 @@ class AgentCore:
         self.data_feed = data_feed
         self.strategy = strategy or VolumeSweetSpotStrategy(settings)
 
+    async def _score_one(
+        self,
+        sym: str,
+        *,
+        threshold: float,
+        short_bias: bool,
+        allow_shorts: bool,
+    ) -> Signal:
+        bars = await self.data_feed.get_ohlc(sym, interval=5)
+        if len(bars) < 30:
+            return Signal(symbol=sym, side="WAIT", score=0.0, reason="no bars")
+        closes = DataFeed.series(bars, "c")
+        volumes = DataFeed.series(bars, "v")
+        highs = DataFeed.series(bars, "h")
+        lows = DataFeed.series(bars, "l")
+        return self.strategy.score_symbol(
+            sym,
+            closes,
+            volumes,
+            highs,
+            lows,
+            threshold=threshold,
+            short_bias=short_bias,
+            allow_shorts=allow_shorts,
+        )
+
     async def scan(
         self,
         symbols: List[str],
@@ -31,27 +58,17 @@ class AgentCore:
         short_bias: bool = False,
     ) -> Tuple[List[Signal], float]:
         t0 = time.perf_counter()
-        signals: List[Signal] = []
         allow_shorts = bool(getattr(self.settings, "allow_paper_shorts", False))
-        for sym in symbols:
-            bars = await self.data_feed.get_ohlc(sym, interval=5)
-            if len(bars) < 30:
-                signals.append(Signal(symbol=sym, side="WAIT", score=0.0, reason="no bars"))
-                continue
-            closes = DataFeed.series(bars, "c")
-            volumes = DataFeed.series(bars, "v")
-            highs = DataFeed.series(bars, "h")
-            lows = DataFeed.series(bars, "l")
-            sig = self.strategy.score_symbol(
-                sym,
-                closes,
-                volumes,
-                highs,
-                lows,
-                threshold=threshold,
-                short_bias=short_bias,
-                allow_shorts=allow_shorts,
-            )
-            signals.append(sig)
+        signals = await asyncio.gather(
+            *[
+                self._score_one(
+                    sym,
+                    threshold=threshold,
+                    short_bias=short_bias,
+                    allow_shorts=allow_shorts,
+                )
+                for sym in symbols
+            ]
+        )
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        return signals, elapsed_ms
+        return list(signals), elapsed_ms

@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     dry_run: bool = False
     broker: str = "kraken"
     account_equity: float = 3000.0
-    symbols: str = "BTC-USD,ETH-USD,SOL-USD,LINK-USD"
+    symbols: str = "BTC-USD,ETH-USD,SOL-USD,LINK-USD,XCN-USD"
     symbol_mode: str = "ALLOWLIST"
     universe_stocks: bool = False
     allow_paper_shorts: bool = False
@@ -73,7 +73,7 @@ class Settings(BaseSettings):
     elite_atr_sl_mult: float = 1.5
     max_spread_pct: float = 0.0025
     rvol_breakout_mult: float = 2.0
-    agent_poll_seconds: float = 30.0
+    agent_poll_seconds: float = 5.0
     max_hold_minutes: float = 240.0
     taker_fee_rate: float = 0.008
     maker_fee_rate: float = 0.004

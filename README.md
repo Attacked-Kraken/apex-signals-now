@@ -61,3 +61,7 @@ Never enable live without explicit operator request + `/confirm_live`.
 ## Layout
 
 See archive §4. Key paths: `data/paper_book_2.json`, `data/trading_bot_2.db`.
+
+## Symbols
+
+Default allowlist: BTC-USD, ETH-USD, SOL-USD, LINK-USD, **XCN-USD** (Onyxcoin).
