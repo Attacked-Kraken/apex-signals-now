@@ -79,7 +79,7 @@ class Settings(BaseSettings):
     agent_poll_seconds: float = 1.0
     # Anti-abuse / API pacing
     kraken_public_min_interval: float = 0.2
-    ohlc_cache_seconds: float = 8.0
+    ohlc_cache_seconds: float = 20.0
     ohlc_fetch_concurrency: int = 5
     rate_limit_trip_after: int = 2
     rate_limit_cooldown_seconds: float = 120.0
@@ -118,14 +118,29 @@ class Settings(BaseSettings):
 _settings: Optional[Settings] = None
 
 
+def _scrub_placeholder_telegram_env() -> None:
+    """Ignore shell YOUR_… placeholders so real values from .env can load."""
+    import os
+
+    for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
+        val = (os.environ.get(key) or "").strip()
+        if not val:
+            continue
+        upper = val.upper()
+        if upper.startswith("YOUR_") or upper in {"CHANGEME", "PLACEHOLDER", "TODO"}:
+            os.environ.pop(key, None)
+
+
 def get_settings() -> Settings:
     global _settings
     if _settings is None:
+        _scrub_placeholder_telegram_env()
         _settings = Settings()
     return _settings
 
 
 def reload_settings() -> Settings:
     global _settings
+    _scrub_placeholder_telegram_env()
     _settings = Settings()
     return _settings

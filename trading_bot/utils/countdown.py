@@ -31,10 +31,11 @@ def format_countdown_clock(seconds: float) -> str:
 
 
 def format_alarm_clock_countdown(seconds: float, *, bold: bool = True) -> str:
-    """Loud clock motif: ⏰⏰   MM:SS   ⏰⏰ (time optionally HTML-bold)."""
+    """Loud clock motif: ⏰⏰   MM:SS   ⏰⏰ (no HTML — Telegram HTML parse often breaks /status)."""
     clock = format_countdown_clock(seconds)
-    time_s = f"<b>{clock}</b>" if bold else clock
-    return f"⏰⏰   {time_s}   ⏰⏰"
+    # bold flag kept for API compat; visual weight comes from alarm emojis + spacing
+    _ = bold
+    return f"⏰⏰   {clock}   ⏰⏰"
 
 
 def format_trading_resume_countdown_line(

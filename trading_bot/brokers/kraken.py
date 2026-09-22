@@ -49,9 +49,10 @@ class KrakenBroker(BrokerBase):
         self._last_public = 0.0
         self._client: Optional[httpx.AsyncClient] = None
         self._ticker_cache: Dict[str, Tuple[float, Dict[str, float]]] = {}
-        self._ticker_cache_ttl = 1.0
+        # Reuse marks across /status + balances + scan (was 1s → frequent refetches).
+        self._ticker_cache_ttl = 4.0
         # Longer stale-ok window for /status (prefer last-known over blocking).
-        self._status_mark_max_age = 8.0
+        self._status_mark_max_age = 20.0
         self._ensure_book(account_equity)
 
     def _ensure_book(self, equity: float) -> None:
@@ -195,6 +196,104 @@ class KrakenBroker(BrokerBase):
             "status": self.dead_man_status(),
         }
 
+    @staticmethod
+    def compute_daily_pct(last: Any, day_open: Any) -> Optional[float]:
+        """UTC-session daily %: (last - day_open) / day_open * 100."""
+        try:
+            last_f = float(last)
+            open_f = float(day_open)
+        except (TypeError, ValueError):
+            return None
+        if open_f <= 0 or last_f <= 0:
+            return None
+        return (last_f - open_f) / open_f * 100.0
+
+    @staticmethod
+    def _parse_day_open(open_raw: Any) -> Tuple[float, float]:
+        """Kraken `o` is usually a string (today open), sometimes [today, 24h].
+
+        Never index a string — o[0] on "86598" is the char "8".
+        """
+        open_px = 0.0
+        open_24h = 0.0
+        try:
+            if isinstance(open_raw, str):
+                open_px = float(open_raw or 0)
+                open_24h = open_px
+            elif isinstance(open_raw, (list, tuple)):
+                if open_raw:
+                    open_px = float(open_raw[0] or 0)
+                if len(open_raw) > 1:
+                    open_24h = float(open_raw[1] or 0)
+                else:
+                    open_24h = open_px
+            elif open_raw is not None:
+                open_px = float(open_raw or 0)
+                open_24h = open_px
+        except (TypeError, ValueError):
+            return 0.0, 0.0
+        return open_px, open_24h
+
+    @staticmethod
+    def _parse_ticker_row(row: Dict[str, Any]) -> Dict[str, float]:
+        """Parse Kraken Ticker row → bid/ask/last/mid + session open/daily_pct."""
+        bid = float(row["b"][0])
+        ask = float(row["a"][0])
+        last = float(row["c"][0])
+        open_px, open_24h = KrakenBroker._parse_day_open(row.get("o"))
+        daily_pct = KrakenBroker.compute_daily_pct(last, open_px)
+        out: Dict[str, float] = {
+            "bid": bid,
+            "ask": ask,
+            "last": last,
+            "mid": (bid + ask) / 2.0,
+            "open": open_px,
+            "open_24h": open_24h,
+        }
+        # Always set key so cache hits are known to include daily fields.
+        out["daily_pct"] = daily_pct  # type: ignore[assignment]
+        return out
+
+    @staticmethod
+    def _ticker_has_daily(tick: Optional[Dict[str, float]]) -> bool:
+        """True only when day open or a real daily_pct is present (not OHLC-only)."""
+        if not isinstance(tick, dict):
+            return False
+        if tick.get("daily_pct") is not None:
+            return True
+        try:
+            return float(tick.get("open") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _map_ticker_result_key(
+        key: str, pair_to_sym: Dict[str, str]
+    ) -> Optional[str]:
+        """Map Kraken result key (XXBTZUSD / SOLUSD) → our symbol."""
+        if key in pair_to_sym:
+            return pair_to_sym[key]
+        candidates = [key]
+        for zquote, quote in (
+            ("ZUSD", "USD"),
+            ("ZEUR", "EUR"),
+            ("ZGBP", "GBP"),
+            ("ZCAD", "CAD"),
+            ("ZJPY", "JPY"),
+        ):
+            if key.startswith("X") and key.endswith(zquote) and len(key) > len(zquote) + 1:
+                base = key[1 : -len(zquote)]  # XXBTZUSD→XBT, XETHZUSD→ETH
+                candidates.append(base + quote)
+                break
+        for cand in candidates:
+            hit = pair_to_sym.get(cand)
+            if hit is not None:
+                return hit
+        for pk, sym in pair_to_sym.items():
+            if key.endswith(pk) or pk in key or key in pk:
+                return sym
+        return None
+
     def peek_cached_ticker(
         self, symbol: str, *, max_age: Optional[float] = None
     ) -> Optional[Dict[str, float]]:
@@ -208,13 +307,34 @@ class KrakenBroker(BrokerBase):
         return None
 
     def cache_ticker(self, symbol: str, tick: Dict[str, float]) -> None:
-        """Seed/refresh ticker cache (e.g. OHLC last close for /status)."""
-        self._ticker_cache[symbol] = (time.time(), dict(tick))
+        """Seed/refresh ticker cache (e.g. OHLC last close for /status).
+
+        Never let an OHLC close-only seed wipe a prior day-open / daily_pct.
+        When open is preserved and last updates, recompute daily %.
+        """
+        merged = dict(tick)
+        prev = self._ticker_cache.get(symbol)
+        if prev and not self._ticker_has_daily(merged) and self._ticker_has_daily(prev[1]):
+            for k in ("open", "open_24h"):
+                if k in prev[1] and k not in merged:
+                    merged[k] = prev[1][k]
+        last = merged.get("last") or merged.get("mid")
+        open_px = merged.get("open")
+        recomputed = self.compute_daily_pct(last, open_px)
+        if recomputed is not None:
+            merged["daily_pct"] = recomputed  # type: ignore[assignment]
+        elif "daily_pct" not in merged and prev and prev[1].get("daily_pct") is not None:
+            merged["daily_pct"] = prev[1]["daily_pct"]
+        self._ticker_cache[symbol] = (time.time(), merged)
 
     async def get_ticker(self, symbol: str) -> Dict[str, float]:
         now = time.time()
         hit = self._ticker_cache.get(symbol)
-        if hit and now - hit[0] < self._ticker_cache_ttl:
+        if (
+            hit
+            and now - hit[0] < self._ticker_cache_ttl
+            and self._ticker_has_daily(hit[1])
+        ):
             return hit[1]
         pair = self._to_kraken_pair(symbol)
         try:
@@ -222,10 +342,7 @@ class KrakenBroker(BrokerBase):
             # result keys vary; take first
             key = next(iter(result))
             row = result[key]
-            bid = float(row["b"][0])
-            ask = float(row["a"][0])
-            last = float(row["c"][0])
-            out = {"bid": bid, "ask": ask, "last": last, "mid": (bid + ask) / 2.0}
+            out = self._parse_ticker_row(row)
             self._ticker_cache[symbol] = (now, out)
             if self.live_safety is not None:
                 self.live_safety.note_ticker_ok(symbol)
@@ -242,7 +359,6 @@ class KrakenBroker(BrokerBase):
             # dry synthetic
             return {"bid": 0.0, "ask": 0.0, "last": 0.0, "mid": 0.0}
 
-
     async def get_tickers(self, symbols: List[str]) -> Dict[str, Dict[str, float]]:
         """Batch public Ticker for many symbols in one request (faster marks)."""
         out: Dict[str, Dict[str, float]] = {}
@@ -250,7 +366,11 @@ class KrakenBroker(BrokerBase):
         now = time.time()
         for sym in symbols:
             hit = self._ticker_cache.get(sym)
-            if hit and now - hit[0] < self._ticker_cache_ttl:
+            if (
+                hit
+                and now - hit[0] < self._ticker_cache_ttl
+                and self._ticker_has_daily(hit[1])
+            ):
                 out[sym] = hit[1]
             else:
                 need.append(sym)
@@ -262,18 +382,10 @@ class KrakenBroker(BrokerBase):
             result = await self._public_get("/0/public/Ticker", {"pair": pairs})
             for key, row in (result or {}).items():
                 # Kraken may return altname keys; map best-effort
-                sym = pair_to_sym.get(key)
-                if sym is None:
-                    for pk, s in pair_to_sym.items():
-                        if key.endswith(pk) or pk in key or key in pk:
-                            sym = s
-                            break
+                sym = self._map_ticker_result_key(key, pair_to_sym)
                 if sym is None:
                     continue
-                bid = float(row["b"][0])
-                ask = float(row["a"][0])
-                last = float(row["c"][0])
-                tick = {"bid": bid, "ask": ask, "last": last, "mid": (bid + ask) / 2.0}
+                tick = self._parse_ticker_row(row)
                 self._ticker_cache[sym] = (now, tick)
                 out[sym] = tick
                 if self.live_safety is not None:
@@ -486,14 +598,21 @@ class KrakenBroker(BrokerBase):
                 exposure += abs(p.qty * mark)
         equity = cash + exposure
         closed = book.get("closed_trades") or []
-        wins = sum(1 for t in closed if t.get("won"))
-        losses = sum(1 for t in closed if not t.get("won"))
+        wins = sum(1 for t in closed if t.get("won") or float(t.get("pnl") or 0) > 0)
+        losses = sum(1 for t in closed if not (t.get("won") or float(t.get("pnl") or 0) > 0))
+        realized = 0.0
+        for t in closed:
+            try:
+                realized += float(t.get("pnl") or 0)
+            except (TypeError, ValueError):
+                pass
         return {
             "cash": cash,
             "equity": equity,
             "exposure": exposure,
             "wins": wins,
             "losses": losses,
+            "realized_pnl": realized,
             "day_start_equity": float(book.get("day_start_equity", cash)),
             "consecutive_losses": int(book.get("consecutive_losses", 0)),
             "closed_trades": closed,

@@ -26,3 +26,16 @@ data/active_params_2.json
 !data/.gitkeep
 data/future_pack.json
 data/bot_heartbeat.json
+
+# secrets / local env backups
+.env.*
+!.env.example
+*.bak
+*.bak-*
+
+# extra runtime / paper / bypass state
+data/.runtime_env_hint
+data/cb_phd_bypass.json
+data/paper_*.json
+data/paper_*.log
+data/*.log

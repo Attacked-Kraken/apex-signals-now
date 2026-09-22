@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 
 # Wall-clock CB cooldown file (survives process restart; monotonic alone does not).
 DEFAULT_CB_STATE_PATH = Path("data/cb_auto_resume.json")
+# Post-CB PHD WEAK soft-gate bypass (survives restart; cleared on next CB arm).
+DEFAULT_PHD_BYPASS_PATH = Path("data/cb_phd_bypass.json")
 
 
 @dataclass
@@ -31,6 +33,7 @@ class OpsState:
     cb_win_since_trip: bool = False
     CB_AUTO_RESUME_COOLDOWN_SEC: float = 45 * 60
     cb_state_path: Optional[Path] = None
+    phd_bypass_path: Optional[Path] = None
     last_scan_ms: Optional[float] = None
     last_scan_n: Optional[int] = None
     last_tick_ts: float = field(default_factory=time.time)
@@ -49,6 +52,60 @@ class OpsState:
 
     def _cb_path(self) -> Path:
         return Path(self.cb_state_path) if self.cb_state_path else DEFAULT_CB_STATE_PATH
+
+    def _phd_bypass_path(self) -> Path:
+        return Path(self.phd_bypass_path) if self.phd_bypass_path else DEFAULT_PHD_BYPASS_PATH
+
+    def _persist_phd_weak_bypass(self) -> None:
+        """Write phd_weak_bypass_after_cb so WEAK soft-gate stays off across restarts."""
+        path = self._phd_bypass_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            active = bool(self.extra.get("phd_weak_bypass_after_cb"))
+            if not active:
+                if path.exists():
+                    path.unlink()
+                return
+            payload = {
+                "phd_weak_bypass_after_cb": True,
+                "updated_at": time.time(),
+            }
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("phd bypass persist failed: %s", exc)
+
+    def _clear_phd_weak_bypass(self) -> None:
+        self.extra.pop("phd_weak_bypass_after_cb", None)
+        path = self._phd_bypass_path()
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("phd bypass clear failed: %s", exc)
+
+    def set_phd_weak_bypass_after_cb(self, value: bool = True) -> None:
+        """Enable/disable post-CB WEAK soft-gate bypass and persist to disk."""
+        if value:
+            self.extra["phd_weak_bypass_after_cb"] = True
+            self._persist_phd_weak_bypass()
+        else:
+            self._clear_phd_weak_bypass()
+
+    def restore_phd_weak_bypass_from_disk(self) -> bool:
+        """Reload phd_weak_bypass_after_cb after process restart. Returns True if restored."""
+        path = self._phd_bypass_path()
+        if not path.exists():
+            return False
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("phd bypass load failed: %s", exc)
+            return False
+        if not bool(data.get("phd_weak_bypass_after_cb")):
+            return False
+        self.extra["phd_weak_bypass_after_cb"] = True
+        logger.info("restored phd_weak_bypass_after_cb from disk")
+        return True
 
     def _persist_cb_state(self) -> None:
         path = self._cb_path()
@@ -119,6 +176,8 @@ class OpsState:
         self.cb_win_since_trip = False
         self.cb_active = True
         self.paused = True
+        # Next CB trip: drop any post-resume PHD WEAK soft-gate bypass (memory + disk).
+        self._clear_phd_weak_bypass()
         self._persist_cb_state()
         return int(round(cd / 60.0))
 
@@ -152,11 +211,18 @@ class OpsState:
         return 0.0
 
     def cb_auto_resume_ready(self, *, regime_bull_ok: bool) -> bool:
+        """True when CB cooldown has expired while still armed+paused.
+
+        Timer expiry IS the decision — callers may pass regime_bull_ok for
+        logging/API compat; win/regime are not required to resume.
+        """
         if not self.cb_auto_resume_armed or not self.paused:
             return False
         if self.cb_auto_resume_remaining_seconds() > 0.0:
             return False
-        return bool(self.cb_win_since_trip) or bool(regime_bull_ok)
+        # Keep param referenced so callers/linters stay happy.
+        _ = bool(regime_bull_ok)
+        return True
 
 
     def touch_tick(self) -> None:

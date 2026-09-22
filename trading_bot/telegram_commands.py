@@ -25,6 +25,9 @@ _CT = ZoneInfo("America/Chicago")
 
 STATUS_SYMBOLS_CALLBACK = "status:symbols"
 STATUS_SYMBOLS_COLLAPSE = "status:symbols_collapse"
+PNL_TRADES_CALLBACK = "pnl:trades"
+PNL_TRADES_COLLAPSE = "pnl:trades_collapse"
+PNL_COMPACT_PREVIEW = 3
 
 
 @dataclass
@@ -69,6 +72,34 @@ def _status_compact_body(message_text: str) -> str:
     if idx >= 0:
         return text[:idx].rstrip()
     return text.rstrip()
+
+
+def pnl_expand_keyboard(count: int) -> Dict[str, Any]:
+    """Inline ▼ button under /pnl — expands full trade list in place."""
+    n = int(count)
+    label = f"▼ Trades ({n})" if n else "▼ Trades"
+    return {"inline_keyboard": [[{"text": label, "callback_data": PNL_TRADES_CALLBACK}]]}
+
+
+def pnl_collapse_keyboard(count: int) -> Dict[str, Any]:
+    n = int(count)
+    label = f"▲ Hide trades ({n})" if n else "▲ Hide trades"
+    return {"inline_keyboard": [[{"text": label, "callback_data": PNL_TRADES_COLLAPSE}]]}
+
+
+def pnl_with_trades_button(
+    text: str,
+    *,
+    trade_count: int,
+    expanded: bool = False,
+    parse_mode: Optional[str] = None,
+) -> TelegramReply:
+    """Wrap /pnl text with expand (compact) or collapse (expanded) keyboard."""
+    n = int(trade_count)
+    if n <= PNL_COMPACT_PREVIEW and not expanded:
+        return TelegramReply(text=text, parse_mode=parse_mode)
+    markup = pnl_collapse_keyboard(n) if expanded else pnl_expand_keyboard(n)
+    return TelegramReply(text=text, reply_markup=markup, parse_mode=parse_mode)
 
 BOT_COMMAND_SPECS: List[Tuple[str, str]] = [
     ("status", "PAPER/LIVE snapshot"),
@@ -743,6 +774,118 @@ def execute_set_trade_profile(
 
 
 
+DAILY_BOARD_FULL_MAX = 8
+DAILY_BOARD_WINDOW = 7
+
+
+def short_symbol_label(symbol: str) -> str:
+    """BTC-USD / BTC/USD → BTC."""
+    s = str(symbol or "").strip()
+    if not s:
+        return "?"
+    base = s.replace("/", "-").split("-", 1)[0]
+    return base or s
+
+
+def format_daily_pct_token(pct: Optional[float]) -> str:
+    """Plain daily % — +/− only (no colored circle emojis)."""
+    if pct is None:
+        return "n/a"
+    try:
+        p = float(pct)
+    except (TypeError, ValueError):
+        return "n/a"
+    if p > 0:
+        return f"+{p:.2f}%"
+    if p < 0:
+        return f"{p:.2f}%"  # already has minus
+    return "+0.00%"
+
+
+def format_daily_price(price: Optional[float]) -> str:
+    """Format a crypto mark without losing useful precision on small coins."""
+    if price is None:
+        return "n/a"
+    try:
+        p = float(price)
+    except (TypeError, ValueError):
+        return "n/a"
+    if p <= 0:
+        return "n/a"
+    if p >= 1:
+        decimals = 2
+    elif p >= 0.1:
+        decimals = 4
+    elif p >= 0.01:
+        decimals = 5
+    else:
+        decimals = 8
+    return f"${p:,.{decimals}f}"
+
+
+def format_daily_board_line(
+    symbol: str, pct: Optional[float], price: Optional[float] = None
+) -> str:
+    label = short_symbol_label(symbol)
+    # Keep the three columns readable in plain-text Telegram messages.
+    return f"{label:<6}{format_daily_price(price):<13}{format_daily_pct_token(pct)}"
+
+
+def rotate_daily_board(
+    rows: Sequence[Dict[str, Any]],
+    rot_index: int,
+    *,
+    full_max: int = DAILY_BOARD_FULL_MAX,
+    window: int = DAILY_BOARD_WINDOW,
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    """Rotate top→bottom; return (visible_rows, next_rot_index, hidden_count).
+
+    Show all rows when n <= full_max (~8). Otherwise a window of ~6–8.
+    """
+    items = [r for r in rows if isinstance(r, dict)]
+    n = len(items)
+    if n == 0:
+        return [], 0, 0
+    try:
+        idx = int(rot_index) % n
+    except (TypeError, ValueError, ZeroDivisionError):
+        idx = 0
+    ordered = items[idx:] + items[:idx]
+    next_idx = (idx + 1) % n
+    if n <= int(full_max):
+        return ordered, next_idx, 0
+    w = max(6, min(8, int(window)))
+    return ordered[:w], next_idx, n - w
+
+
+def format_daily_price_board(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    rot_index: int = 0,
+    title: str = "Daily:",
+    full_max: int = DAILY_BOARD_FULL_MAX,
+    window: int = DAILY_BOARD_WINDOW,
+) -> Tuple[List[str], int]:
+    """Build vertical daily % board lines + advanced rotation index."""
+    shown, next_idx, more = rotate_daily_board(
+        rows, rot_index, full_max=full_max, window=window
+    )
+    lines: List[str] = [str(title)]
+    if shown:
+        lines.append("")
+    for r in shown:
+        lines.append(
+            format_daily_board_line(
+                str(r.get("symbol") or "?"),
+                r.get("pct"),
+                r.get("price"),
+            )
+        )
+    if more > 0:
+        lines.append(f"… +{more} more")
+    return lines, next_idx
+
+
 def format_status_reply(
     *,
     paper_cash: float,
@@ -788,16 +931,22 @@ def format_status_reply(
     circuit_breaker_on: bool = False,
     circuit_breaker_consec_losses: int = 0,
     circuit_breaker_resume_seconds: Optional[float] = None,
+    circuit_breaker_paused: bool = False,
+    phd_weak_bypass_after_cb: bool = False,
     rate_limit_resume_seconds: Optional[float] = None,
     caps_locked: bool = False,
     majors_only: Optional[bool] = None,
     majors_symbols: Optional[Sequence[str]] = None,
+    daily_board_lines: Optional[Sequence[str]] = None,
 ) -> str:
     """Unified /status reply (Apex Signals Now) — same layout on Kraken + Coinbase.
 
     Field order (operator layout):
       Apex Signals Now {PAPER|LIVE} status
-      Last Scan Latency / last_tick_age / circuit breaker
+      Last Scan Latency / last_tick_age
+      api_risk → formula → phd → quant
+      circuit breaker → ⏰⏰ countdown → caption
+      Daily board (blank line after "Daily:")
       cash=… / equity=… (+ WR)
       pause=… (only when paused)
       Market: …
@@ -839,14 +988,7 @@ def format_status_reply(
             wr_big = "WR —"
             wr_sub = "0W/0L"
 
-    def _row(left: str, right: str = "", width: int = 36) -> str:
-        if not right:
-            return left
-        # keep right edge readable on mobile Telegram
-        gap = max(2, width - len(left) - len(right))
-        return f"{left}{' ' * gap}{right}"
-
-    # --- header + scan health (top) ---
+    # --- header + scan health (classic vertical stack) ---
     lines = [
         f"Apex Signals Now {mode} status",
         "",
@@ -885,10 +1027,26 @@ def format_status_reply(
     except (TypeError, ValueError):
         cl = 0
     # Telegram bots cannot set font color; 🔴 is the supported "red" cue
-    lines.append(
-        f"(⚠️☣️circuit breaker ☣️⚠️) {cb_state} · {cl} consecutive loss"
-        f"{'' if cl == 1 else 'es'}"
-    )
+    cb_bits = [
+        f"(⚠️☣️circuit breaker ☣️⚠️) {cb_state}",
+        f"{cl} consecutive loss{'' if cl == 1 else 'es'}",
+    ]
+    # CB pause+armed: compact remaining cooldown on the CB line itself.
+    cb_rem_for_note: Optional[float] = None
+    if circuit_breaker_resume_seconds is not None:
+        try:
+            cb_rem_for_note = float(circuit_breaker_resume_seconds)
+        except (TypeError, ValueError):
+            cb_rem_for_note = 0.0
+    if circuit_breaker_paused and cb_rem_for_note is not None and cb_rem_for_note > 0:
+        mins = max(1, int(round(cb_rem_for_note / 60.0)))
+        cb_bits.append(f"paused · resumes in {mins}m")
+    elif circuit_breaker_paused:
+        cb_bits.append("paused")
+    elif phd_weak_bypass_after_cb:
+        # Auto-resume already fired; WEAK soft-gate bypassed until next CB trip.
+        cb_bits.append("auto-resumed · WEAK bypass")
+    lines.append(" · ".join(cb_bits))
     # Always show loud clock countdown when CB pause is active (incl. 00:00).
     # None = not in CB pause; any float (incl. 0) = show clock under the CB line.
     if circuit_breaker_resume_seconds is not None:
@@ -907,6 +1065,9 @@ def format_status_reply(
                 rl_rem, kind="API rate-limit / 429 pause"
             )
         )
+    # Daily board: vertical stack under countdown (no side-by-side _row packing).
+    if daily_board_lines:
+        lines.extend(str(x) for x in daily_board_lines)
     lines.append("")
     lines.append("")
 
@@ -922,7 +1083,22 @@ def format_status_reply(
         wr_bits = [b for b in (wr_big, wr_sub) if b]
         lines.append(" · ".join(wr_bits) if wr_bits else "WR —")
     if paused:
-        lines.append(f"pause={pause_s}")
+        # Prefer CB-aware pause caption when cooldown is running.
+        if (
+            circuit_breaker_paused
+            and circuit_breaker_resume_seconds is not None
+        ):
+            try:
+                rem_p = float(circuit_breaker_resume_seconds)
+            except (TypeError, ValueError):
+                rem_p = 0.0
+            if rem_p > 0:
+                mins_p = max(1, int(round(rem_p / 60.0)))
+                lines.append(f"pause=paused · resumes in {mins_p}m")
+            else:
+                lines.append(f"pause={pause_s}")
+        else:
+            lines.append(f"pause={pause_s}")
     lines.append("")
 
     # --- market + caps ---
@@ -2429,6 +2605,39 @@ def day_trades_from_ledger(
     return trades
 
 
+def _pnl_trade_when_ts(trade: Dict[str, Any]) -> float:
+    """Sort key for /pnl rows — newest close first (missing when → bottom)."""
+    when = trade.get("when") if isinstance(trade, dict) else None
+    if isinstance(when, datetime):
+        try:
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            return float(when.timestamp())
+        except (TypeError, ValueError, OSError, OverflowError):
+            return float("-inf")
+    if isinstance(when, (int, float)):
+        try:
+            return float(when)
+        except (TypeError, ValueError):
+            return float("-inf")
+    if isinstance(when, str) and when:
+        try:
+            parsed = datetime.fromisoformat(when.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return float(parsed.timestamp())
+        except ValueError:
+            return float("-inf")
+    return float("-inf")
+
+
+def sort_pnl_trades_newest_first(
+    trades: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return closed-trade rows newest-first (last close at top)."""
+    return sorted(list(trades or []), key=_pnl_trade_when_ts, reverse=True)
+
+
 def format_performance_report(
     *,
     trades: Sequence[Dict[str, Any]],
@@ -2436,8 +2645,15 @@ def format_performance_report(
     equity: float,
     paper: bool = True,
     now: Optional[datetime] = None,
+    scope: str = "Day",
+    compact: bool = False,
+    preview_n: int = PNL_COMPACT_PREVIEW,
 ) -> str:
-    """📊 CRUZBOT PERFORMANCE REPORT — production /pnl table layout."""
+    """📊 CRUZBOT PERFORMANCE REPORT — production /pnl table layout.
+
+    Rows are always newest-first. compact=True shows only the newest
+    ``preview_n`` trade rows; WR / net P&L / bankroll still use the full set.
+    """
     now_dt = now or datetime.now(_CT)
     if now_dt.tzinfo is None:
         now_dt = now_dt.replace(tzinfo=_CT)
@@ -2459,10 +2675,30 @@ def format_performance_report(
     def money_plain(x: float) -> str:
         return f"${x:,.2f}"
 
+    all_trades = sort_pnl_trades_newest_first(trades)
     day_net = 0.0
     wins = 0
     losses = 0
-    for t in trades:
+    for t in all_trades:
+        pnl = float(t.get("pnl") or 0)
+        day_net += pnl
+        if pnl > 0:
+            wins += 1
+        else:
+            losses += 1
+
+    total = len(all_trades)
+    try:
+        preview = max(0, int(preview_n))
+    except (TypeError, ValueError):
+        preview = PNL_COMPACT_PREVIEW
+    show = all_trades
+    truncated = False
+    if compact and preview >= 0 and total > preview:
+        show = all_trades[:preview]
+        truncated = True
+
+    for t in show:
         when = t.get("when")
         if isinstance(when, datetime):
             if when.tzinfo is None:
@@ -2478,16 +2714,12 @@ def format_performance_report(
         cost = float(t.get("cost") or 0)
         exit_v = float(t.get("exit") or 0)
         pnl = float(t.get("pnl") or 0)
-        day_net += pnl
-        if pnl > 0:
-            wins += 1
-        else:
-            losses += 1
         lines.append(
             f"{when_s:<8} | {sym:<8} | {money_plain(cost)} | {money_plain(exit_v)} | {money(pnl)}"
         )
+    if truncated:
+        lines.append(f"… showing {len(show)} of {total} · tap ▼ for all")
     lines.append(sep)
-    total = len(trades)
     if total:
         wr = 100.0 * wins / total
         wr_s = f"{wr:.0f}% ({wins}W / {losses}L)"
@@ -2496,7 +2728,8 @@ def format_performance_report(
     bank_label = "Paper Bankroll" if paper else "Live Bankroll"
     lines.append(f"• Total Trades: {total}")
     lines.append(f"• Win Rate: {wr_s}")
-    lines.append(f"• Day Net P&L: {money(day_net)}")
+    scope_l = (scope or "Day").strip() or "Day"
+    lines.append(f"• {scope_l} Net P&L: {money(day_net)}")
     lines.append(f"• {bank_label}: ${float(cash):,.2f} | ${float(equity):,.2f}")
     return "\n".join(lines)
 
@@ -2505,8 +2738,13 @@ def closed_trades_to_day_rows(
     closed: Sequence[Dict[str, Any]],
     *,
     now: Optional[datetime] = None,
+    session: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Map paper-book closed_trades into performance_report rows (today only)."""
+    """Map paper-book closed_trades into performance_report rows.
+
+    Default: today (America/Chicago) only. session=True → all closed trades
+    (session / book history) so /pnl is not blank after midnight CT.
+    """
     now_dt = now or datetime.now(_CT)
     if now_dt.tzinfo is None:
         now_dt = now_dt.replace(tzinfo=_CT)
@@ -2515,7 +2753,12 @@ def closed_trades_to_day_rows(
     day_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
     out: List[Dict[str, Any]] = []
     for t in closed or []:
-        raw_when = t.get("closed_at") or t.get("when") or t.get("ts")
+        raw_when = (
+            t.get("closed_at")
+            or t.get("closed_at")
+            or t.get("when")
+            or t.get("ts")
+        )
         when: Optional[datetime] = None
         if isinstance(raw_when, datetime):
             when = raw_when
@@ -2534,7 +2777,7 @@ def closed_trades_to_day_rows(
         if when.tzinfo is None:
             when = when.replace(tzinfo=timezone.utc)
         when_ct = when.astimezone(_CT)
-        if when_ct < day_start:
+        if not session and when_ct < day_start:
             continue
         qty = float(t.get("qty") or 0)
         entry = float(t.get("entry") or 0)
@@ -2752,6 +2995,12 @@ class TelegramCommandListener:
         self._lock_fd = None
         self._client: Optional[httpx.AsyncClient] = None
         self._stop = asyncio.Event()
+        # Health for TG auto-heal watchdog (monotonic seconds)
+        self.last_ok_ts: float = 0.0
+        self.consecutive_409s: int = 0
+        self.last_error: str = ""
+        self.poll_ok_count: int = 0
+        self.started_monotonic: float = 0.0
 
     @property
     def bot_id(self) -> str:
@@ -2762,6 +3011,34 @@ class TelegramCommandListener:
     @property
     def lock_path(self) -> str:
         return f"/tmp/cruzbot_tg_{self.bot_id}.lock"
+
+    def touch_ok(self) -> None:
+        """Record a successful getUpdates poll (for auto-heal watchdog)."""
+        self.last_ok_ts = time.monotonic()
+        self.consecutive_409s = 0
+        self.last_error = ""
+        self.poll_ok_count += 1
+
+    def note_conflict_409(self) -> None:
+        self.consecutive_409s += 1
+        self.last_error = "409"
+
+    def age_since_ok(self) -> float:
+        if self.last_ok_ts <= 0:
+            if self.started_monotonic > 0:
+                return time.monotonic() - self.started_monotonic
+            return float("inf")
+        return time.monotonic() - self.last_ok_ts
+
+    def health_snapshot(self) -> Dict[str, Any]:
+        return {
+            "enabled": bool(self.enabled),
+            "idle": bool(self._idle),
+            "last_ok_age_s": round(self.age_since_ok(), 1) if self.last_ok_ts or self.started_monotonic else None,
+            "consecutive_409s": int(self.consecutive_409s),
+            "poll_ok_count": int(self.poll_ok_count),
+            "placeholder": (not self.token) or self.token.startswith("YOUR_"),
+        }
 
     async def stop(self) -> None:
         self._stop.set()
@@ -2851,7 +3128,14 @@ class TelegramCommandListener:
                 # Attach ▼ button only on the first (status) chunk.
                 if reply_markup and i == 0:
                     payload["reply_markup"] = reply_markup
-                await self._api("sendMessage", **payload)
+                try:
+                    await self._api("sendMessage", **payload)
+                except Exception as exc:  # noqa: BLE001
+                    if payload.pop("parse_mode", None) is not None:
+                        logger.warning("sendMessage HTML failed, retry plain: %s", exc)
+                        await self._api("sendMessage", **payload)
+                    else:
+                        raise
         except Exception as exc:  # noqa: BLE001
             logger.warning("sendMessage failed: %s", exc)
 
@@ -2921,6 +3205,9 @@ class TelegramCommandListener:
         await self.set_my_commands()
         # Never log full bot token URLs
         logging.getLogger("httpx").setLevel(logging.WARNING)
+        self.started_monotonic = time.monotonic()
+        self.last_ok_ts = 0.0
+        self._stop = asyncio.Event()
         logger.info("Telegram listener active (lock %s)", self.lock_path)
         while not self._stop.is_set():
             try:
@@ -2930,6 +3217,7 @@ class TelegramCommandListener:
                     timeout=25,
                     allowed_updates=["message", "callback_query"],
                 )
+                self.touch_ok()
                 await asyncio.sleep(0.35)  # rate limit between polls
                 for upd in updates or []:
                     self._offset = max(self._offset, int(upd["update_id"]) + 1)
@@ -2937,8 +3225,15 @@ class TelegramCommandListener:
             except asyncio.CancelledError:
                 break
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Telegram poll error: %s", exc)
-                await asyncio.sleep(2.0)
+                msg = str(exc)
+                # 409 = another getUpdates client (or prior long-poll) — back off harder
+                if "409" in msg or "Conflict" in msg:
+                    self.note_conflict_409()
+                    logger.warning("Telegram poll conflict (409) — backing off 8s: %s", exc)
+                    await asyncio.sleep(8.0)
+                else:
+                    logger.warning("Telegram poll error: %s", exc)
+                    await asyncio.sleep(2.0)
 
     async def _dispatch(self, upd: Dict[str, Any]) -> None:
         cb = upd.get("callback_query")
@@ -3024,6 +3319,37 @@ class TelegramCommandListener:
                 message_id=int(message_id),
                 text=expanded,
                 reply_markup=symbols_collapse_keyboard(n_line),
+            )
+            return
+
+        # /pnl compact ↔ expanded (mirror status symbols toggle)
+        if data in (PNL_TRADES_CALLBACK, PNL_TRADES_COLLAPSE) and message_id is not None:
+            handler = self.callback_handlers.get(data)
+            if handler is None:
+                await self._answer_callback(cq_id, text="Unknown button")
+                return
+            try:
+                body = await handler(data)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("telegram callback %s failed", data)
+                await self._answer_callback(cq_id, text="Error")
+                await self._send_reply(f"Button error: {exc}", chat_id=chat_id)
+                return
+            if isinstance(body, TelegramReply):
+                text_out = body.text or ""
+                markup = body.reply_markup
+            else:
+                text_out = str(body or "")
+                markup = None
+            if len(text_out) > 4090:
+                text_out = text_out[:4080] + "\n… (truncated)"
+            label = "Expanded" if data == PNL_TRADES_CALLBACK else "Collapsed"
+            await self._answer_callback(cq_id, text=label)
+            await self._edit_message(
+                chat_id=chat_id,
+                message_id=int(message_id),
+                text=text_out,
+                reply_markup=markup,
             )
             return
 

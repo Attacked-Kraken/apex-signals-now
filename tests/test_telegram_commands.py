@@ -9,11 +9,17 @@ import pytest
 from trading_bot.telegram_commands import (
     BOT_COMMAND_SPECS,
     KNOWN_COMMANDS,
+    PNL_COMPACT_PREVIEW,
+    PNL_TRADES_CALLBACK,
+    PNL_TRADES_COLLAPSE,
     STATUS_SYMBOLS_CALLBACK,
     STATUS_SYMBOLS_COLLAPSE,
     ResetPaperError,
     TelegramReply,
     WipePaperError,
+    pnl_collapse_keyboard,
+    pnl_expand_keyboard,
+    pnl_with_trades_button,
     symbols_collapse_keyboard,
     symbols_expand_keyboard,
     status_with_symbols_button,
@@ -292,6 +298,8 @@ def test_performance_report_shape():
     assert "Date/Time | Symbol | Cost | Exit | Net P&L" in text
     assert "Paper Bankroll" in text
     assert "Total Trades: 2" in text
+    # Newest close at top (SOL 8:42 before LINK 7:32)
+    assert text.index("SOL-USD") < text.index("LINK-USD")
 
 
 def test_weekly_digest_paper_vs_live_empty(tmp_path):
@@ -659,7 +667,7 @@ def test_format_countdown_duration_shapes():
     assert format_countdown_clock(44 * 60 + 12) == "44:12"
     assert format_countdown_clock(65) == "01:05"
     assert format_countdown_clock(3665) == "1:01:05"
-    assert format_alarm_clock_countdown(44 * 60 + 12) == "⏰⏰   <b>44:12</b>   ⏰⏰"
+    assert format_alarm_clock_countdown(44 * 60 + 12) == "⏰⏰   44:12   ⏰⏰"
     assert format_alarm_clock_countdown(90, bold=False) == "⏰⏰   01:30   ⏰⏰"
 
 
@@ -680,8 +688,8 @@ def test_status_breaker_countdown_bold():
         rate_limit_resume_seconds=45,
     )
     assert "time until trading starts again" in text
-    assert "⏰⏰   <b>44:12</b>   ⏰⏰" in text
-    assert "⏰⏰   <b>00:45</b>   ⏰⏰" in text
+    assert "⏰⏰   44:12   ⏰⏰" in text
+    assert "⏰⏰   00:45   ⏰⏰" in text
     assert "API rate-limit / 429 pause" in text
     # Zero remaining still renders the loud clock when CB pause is active.
     zero = format_status_reply(
@@ -696,7 +704,7 @@ def test_status_breaker_countdown_bold():
         circuit_breaker_consec_losses=3,
         circuit_breaker_resume_seconds=0.0,
     )
-    assert "⏰⏰   <b>00:00</b>   ⏰⏰" in zero
+    assert "⏰⏰   00:00   ⏰⏰" in zero
 
 
 def test_circuity_breaker_status_includes_countdown():
@@ -707,4 +715,131 @@ def test_circuity_breaker_status_includes_countdown():
     )
     assert "TRIPPED" in text
     assert "time until trading starts again" in text
-    assert "⏰⏰   <b>01:30</b>   ⏰⏰" in text
+    assert "⏰⏰   01:30   ⏰⏰" in text
+
+
+def test_pnl_trades_sorted_newest_first():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from trading_bot.telegram_commands import (
+        format_performance_report,
+        sort_pnl_trades_newest_first,
+    )
+
+    ct = ZoneInfo("America/Chicago")
+    trades = [
+        {"when": datetime(2026, 9, 21, 7, 0, tzinfo=ct), "symbol": "A", "cost": 1, "exit": 1, "pnl": 1.0},
+        {"when": datetime(2026, 9, 21, 9, 0, tzinfo=ct), "symbol": "C", "cost": 1, "exit": 1, "pnl": -2.0},
+        {"when": datetime(2026, 9, 21, 8, 0, tzinfo=ct), "symbol": "B", "cost": 1, "exit": 1, "pnl": 3.0},
+    ]
+    ordered = sort_pnl_trades_newest_first(trades)
+    assert [t["symbol"] for t in ordered] == ["C", "B", "A"]
+    text = format_performance_report(
+        trades=trades,
+        cash=1000,
+        equity=1000,
+        paper=True,
+        now=datetime(2026, 9, 21, 12, 0, tzinfo=ct),
+    )
+    assert text.index("C") < text.index("B") < text.index("A")
+    assert "Total Trades: 3" in text
+    assert "Win Rate: 67% (2W / 1L)" in text
+    assert "Day Net P&L: +$2.00" in text
+
+
+def test_pnl_compact_expand_helpers():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from trading_bot.telegram_commands import format_performance_report
+    from trading_bot.notifier import Notifier
+
+    ct = ZoneInfo("America/Chicago")
+    trades = []
+    for i, sym in enumerate(["T1", "T2", "T3", "T4", "T5"]):
+        trades.append(
+            {
+                "when": datetime(2026, 9, 21, 10, i, tzinfo=ct),
+                "symbol": sym,
+                "cost": 10.0,
+                "exit": 11.0,
+                "pnl": 1.0 if i % 2 == 0 else -0.5,
+            }
+        )
+    # Newest-first: T5..T1; compact shows T5 T4 T3
+    compact = format_performance_report(
+        trades=trades,
+        cash=1500,
+        equity=3000,
+        paper=True,
+        now=datetime(2026, 9, 21, 12, 0, tzinfo=ct),
+        compact=True,
+        preview_n=PNL_COMPACT_PREVIEW,
+    )
+    expanded = format_performance_report(
+        trades=trades,
+        cash=1500,
+        equity=3000,
+        paper=True,
+        now=datetime(2026, 9, 21, 12, 0, tzinfo=ct),
+        compact=False,
+    )
+    assert "showing 3 of 5" in compact
+    assert "T5" in compact and "T4" in compact and "T3" in compact
+    assert "T1" not in compact and "T2" not in compact
+    # Totals always from full set
+    assert "Total Trades: 5" in compact
+    assert "Total Trades: 5" in expanded
+    assert "Win Rate:" in compact
+    assert "Day Net P&L:" in compact
+    for sym in ("T1", "T2", "T3", "T4", "T5"):
+        assert sym in expanded
+    assert "showing" not in expanded
+
+    kb = pnl_expand_keyboard(5)
+    assert kb["inline_keyboard"][0][0]["text"] == "▼ Trades (5)"
+    assert kb["inline_keyboard"][0][0]["callback_data"] == PNL_TRADES_CALLBACK
+    hide = pnl_collapse_keyboard(5)
+    assert "▲ Hide trades (5)" in hide["inline_keyboard"][0][0]["text"]
+    assert hide["inline_keyboard"][0][0]["callback_data"] == PNL_TRADES_COLLAPSE
+
+    reply_c = pnl_with_trades_button("compact body", trade_count=5, expanded=False)
+    assert isinstance(reply_c, TelegramReply)
+    assert reply_c.reply_markup == pnl_expand_keyboard(5)
+    reply_e = pnl_with_trades_button("full body", trade_count=5, expanded=True)
+    assert reply_e.reply_markup == pnl_collapse_keyboard(5)
+    short = pnl_with_trades_button("few", trade_count=2, expanded=False)
+    assert short.reply_markup is None
+
+    # Notifier session fallback + compact TelegramReply
+    bal = {
+        "cash": 1500.0,
+        "equity": 3000.0,
+        "closed_trades": [
+            {
+                "symbol": f"S{i}",
+                "entry": 100.0,
+                "exit": 101.0,
+                "qty": 1.0,
+                "pnl": 1.0,
+                "closed_at": datetime(2026, 9, 20, 12, i, tzinfo=ct).isoformat(),
+            }
+            for i in range(5)
+        ],
+    }
+    # now is next day CT → day filter empty → session fallback
+    n = Notifier()
+    compact_reply = n.performance_report(
+        bal, paper=True, now=datetime(2026, 9, 21, 12, 0, tzinfo=ct), expanded=False
+    )
+    assert isinstance(compact_reply, TelegramReply)
+    assert "Session Net P&L" in compact_reply.text
+    assert "Total Trades: 5" in compact_reply.text
+    assert "showing 3 of 5" in compact_reply.text
+    assert compact_reply.reply_markup["inline_keyboard"][0][0]["callback_data"] == PNL_TRADES_CALLBACK
+    full_reply = n.performance_report(
+        bal, paper=True, now=datetime(2026, 9, 21, 12, 0, tzinfo=ct), expanded=True
+    )
+    assert "showing" not in full_reply.text
+    assert full_reply.reply_markup["inline_keyboard"][0][0]["callback_data"] == PNL_TRADES_COLLAPSE
+    # Newest session close at top
+    assert full_reply.text.index("S4") < full_reply.text.index("S0")

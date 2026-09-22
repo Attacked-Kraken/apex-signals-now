@@ -64,6 +64,8 @@ from trading_bot.telegram_commands import (
     REPLY_RESET_PAPER_CONFIRM_EXPIRED,
     REPLY_WIPE_PAPER_CONFIRM_EXPIRED,
     RESET_PAPER_CONFIRM_TTL_SECONDS,
+    PNL_TRADES_CALLBACK,
+    PNL_TRADES_COLLAPSE,
     STATUS_SYMBOLS_CALLBACK,
     STOP_LOSS_PRESETS,
     UNIVERSE_STOCKS_USAGE,
@@ -93,6 +95,7 @@ from trading_bot.telegram_commands import (
     format_reset_paper_done_reply,
     format_reset_paper_pending_reply,
     format_status_reply,
+    format_daily_price_board,
     status_with_symbols_button,
     format_symbols_reply,
     format_universe_status,
@@ -161,9 +164,12 @@ _TIME_EXIT_MAKER_WAIT_SEC = 300.0
 MAJORS_ONLY_DEFAULT = ("BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD", "XCN-USD")
 ENV_PATH = ROOT / ".env"
 # /status delivery: prefer last-known marks over blocking Kraken polls.
-_STATUS_MARK_MAX_AGE = 8.0
-_STATUS_SNAP_TTL = 4.0
-_STATUS_FETCH_TIMEOUT = 1.25
+# Longer TTLs cut Telegram /status build time (warm path ≪100ms).
+_STATUS_MARK_MAX_AGE = 20.0
+_STATUS_SNAP_TTL = 12.0
+_STATUS_FETCH_TIMEOUT = 0.85
+_STATUS_DAILY_TTL = 90.0
+_STATUS_DAILY_MARK_MAX_AGE = 120.0
 
 
 class TradingApp:
@@ -181,6 +187,11 @@ class TradingApp:
             self.ops.restore_cb_state_from_disk()
         except Exception as exc:  # noqa: BLE001
             logger.warning("CB state restore failed: %s", exc)
+        # PHD WEAK soft-gate bypass after CB auto-resume (sibling file; survives clear).
+        try:
+            self.ops.restore_phd_weak_bypass_from_disk()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PHD bypass restore failed: %s", exc)
         self.paper = bool(settings.paper_trading_mode) and not (
             force_live_cli and not settings.paper_trading_mode
         )
@@ -202,6 +213,7 @@ class TradingApp:
         self.live_safety = LiveSafetyTracker()
         # Last-known /status market snapshot (marks/PnL/formula) for fast replies.
         self._status_snap_cache: Dict[str, Any] = {}
+        self._daily_pct_cache: Dict[str, Any] = {}
         self.heartbeat_path = default_heartbeat_path(settings)
         self.future_pack_path = default_future_pack_path(settings)
         self.rate_breaker.ban_risk = self.ban_risk
@@ -262,7 +274,10 @@ class TradingApp:
             min_interval_seconds=settings.xai_min_interval_seconds,
         )
         self.tg: Optional[TelegramCommandListener] = None
+        self.tg_task: Optional[asyncio.Task] = None
         self.notifier = Notifier()
+        self._tg_heal_last_mono: float = 0.0
+        self._tg_placeholder_pinged: bool = False
         self._pending_maker_time_exits: Dict[str, Dict[str, Any]] = {}
         mark_detected_capabilities(path=self.future_pack_path, broker=self.broker)
         self._enforce_winning_formula_sl()
@@ -273,7 +288,7 @@ class TradingApp:
         """Tighten public REST pacing when LIVE; keep snappy settings in PAPER."""
         if self.paper:
             iv = float(getattr(self.settings, "kraken_public_min_interval", 0.2) or 0.2)
-            cache = float(getattr(self.settings, "ohlc_cache_seconds", 8.0) or 8.0)
+            cache = float(getattr(self.settings, "ohlc_cache_seconds", 20.0) or 20.0)
         else:
             iv = float(getattr(self.settings, "kraken_public_min_interval_live", 0.35) or 0.35)
             cache = float(getattr(self.settings, "ohlc_cache_live_seconds", 15.0) or 15.0)
@@ -298,12 +313,30 @@ class TradingApp:
             except Exception as exc:  # noqa: BLE001
                 self.live_safety.note_exception(exc, source="positions")
                 positions = []
+        tg_extra: Dict[str, Any] = {"dead_man": self._dead_man_status()}
+        try:
+            if self.tg is not None:
+                snap = self.tg.health_snapshot()
+                tg_extra["tg_listener"] = (
+                    "idle" if snap.get("idle") else ("ok" if snap.get("poll_ok_count") else "starting")
+                )
+                age = snap.get("last_ok_age_s")
+                if age is not None:
+                    tg_extra["tg_last_ok_age_s"] = age
+                if snap.get("consecutive_409s"):
+                    tg_extra["tg_409s"] = int(snap["consecutive_409s"])
+                if snap.get("placeholder"):
+                    tg_extra["tg_listener"] = "placeholder"
+            elif self.settings.telegram_commands_enabled:
+                tg_extra["tg_listener"] = "off"
+        except Exception:  # noqa: BLE001
+            pass
         write_bot_heartbeat(
             self.heartbeat_path,
             mode="PAPER" if self.paper else "LIVE",
             pid=os.getpid(),
             open_positions=len(positions),
-            extra={"dead_man": self._dead_man_status()},
+            extra=tg_extra,
         )
         # Scaffolding only. Both checks are False until signed AddOrder/Cancel exists.
         if (
@@ -566,6 +599,31 @@ class TradingApp:
         self.ops.extra["btc_regime_ts"] = now
         self.ops.extra["btc_regime_ready"] = True
 
+    async def _maybe_cb_auto_resume(self) -> None:
+        """After CB cooldown expires, unpause and allow new buys (no /resume)."""
+        try:
+            regime = str(getattr(self.regime.state, "regime", "") or "")
+        except Exception:  # noqa: BLE001
+            regime = ""
+        bull_ok = regime == "BULL_OK"
+        try:
+            ready = bool(self.ops.cb_auto_resume_ready(regime_bull_ok=bull_ok))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("cb_auto_resume_ready check failed: %s", exc)
+            return
+        if not ready:
+            return
+        self.ops.set_pause(False)  # clears CB armed/active persisted state
+        self.ops.set_phd_weak_bypass_after_cb(True)  # persist WEAK bypass across restarts
+        logger.info(
+            "CB auto-resume: cooldown done — new buys enabled (regime=%s phd_weak_bypass=1)",
+            regime or "n/a",
+        )
+        try:
+            await self.notifier.send("CB auto-resume: cooldown done — new buys enabled")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("cb auto-resume notify failed: %s", exc)
+
     async def run_once(self) -> None:
         self.ops.touch_tick()
         # Heartbeat every loop, including PAPER. Token-free external-supervisor hook.
@@ -591,6 +649,7 @@ class TradingApp:
         self.ops.extra.pop("rate_limit_note", None)
 
         await self._update_btc_regime()
+        await self._maybe_cb_auto_resume()
 
         bal = await self.broker.get_balances()
         self._update_equity_peak(float(bal.get("equity") or 0.0))
@@ -665,7 +724,12 @@ class TradingApp:
             self.ops.focus_blocked = f"api_risk MEDIUM ({risk_snap.get('score')}/100) — new entries paused"
 
         # PHD soft gate: pause NEW entries when formula band is WEAK (exits still run)
-        if not pause_entries and bool(getattr(self.settings, "phd_mode", False)):
+        # After CB auto-resume, bypass WEAK until the next CB arm (max-DD gate stays).
+        if (
+            not pause_entries
+            and bool(getattr(self.settings, "phd_mode", False))
+            and not bool(self.ops.extra.get("phd_weak_bypass_after_cb"))
+        ):
             try:
                 f_snap = self._evaluate_formula_snap(bal)
                 reason = phd_weak_entry_gate(
@@ -735,6 +799,21 @@ class TradingApp:
 
         self.ops.touch_tick()  # end-of-cycle freshness for /status last_tick_age
 
+        # Periodic WF snapshot (was on /status; keep disk I/O off the Telegram path).
+        try:
+            now_m = time.monotonic()
+            last_wf = float(self.ops.extra.get("wf_snap_ts") or 0.0)
+            if now_m - last_wf >= 30.0 and bool(getattr(self.settings, "winning_formula", False)):
+                f_snap = self._evaluate_formula_snap(bal, persist=False)
+                maybe_save_wf_best_snapshot(
+                    self.settings,
+                    f_snap,
+                    env_path=ENV_PATH if ENV_PATH.exists() else None,
+                )
+                self.ops.extra["wf_snap_ts"] = now_m
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("winning_formula snapshot save skipped: %s", exc)
+
     async def run_loop(self) -> None:
         jitter = float(getattr(self.settings, "agent_poll_jitter_seconds", 0.15) or 0.0)
         logger.info(
@@ -756,6 +835,10 @@ class TradingApp:
                     await self._live_safety_housekeeping()
                 except Exception:  # noqa: BLE001
                     logger.exception("live-safety heartbeat/alert housekeeping failed")
+                try:
+                    await self._maybe_heal_telegram_listener()
+                except Exception:  # noqa: BLE001
+                    logger.exception("tg auto-heal housekeeping failed")
             if self.paper:
                 poll = float(self.settings.agent_poll_seconds or 1.0)
             else:
@@ -867,9 +950,9 @@ class TradingApp:
             self.ops.set_pause(False)
             return "Resumed: new buys enabled."
 
-        async def pnl(_c: str, _a: List[str]) -> str:
+        async def pnl(_c: str, _a: List[str]):
             bal = await self.broker.get_balances()
-            return self.notifier.performance_report(bal, paper=self.paper)
+            return self.notifier.performance_report(bal, paper=self.paper, expanded=False)
 
         async def kill(_c: str, _a: List[str]) -> str:
             await self.broker.cancel_all()
@@ -1677,17 +1760,151 @@ class TradingApp:
             "quant_line": quant_line,
         }
         self._status_snap_cache = snap
-
-        # Best-snapshot save is nice-to-have; never block delivery.
-        try:
-            maybe_save_wf_best_snapshot(
-                self.settings,
-                _formula,
-                env_path=ENV_PATH if ENV_PATH.exists() else None,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("winning_formula snapshot save failed: %s", exc)
+        # WF best-snapshot disk I/O moved off /status hot path (see run_once).
         return snap
+
+
+    @staticmethod
+    def _tick_has_day_open(tick: Optional[Dict[str, Any]]) -> bool:
+        """True when tick carries a usable day open / daily_pct (not 5m OHLC-only)."""
+        if not isinstance(tick, dict):
+            return False
+        has_daily = getattr(KrakenBroker, "_ticker_has_daily", None)
+        if callable(has_daily):
+            return bool(has_daily(tick))
+        if tick.get("daily_pct") is not None:
+            return True
+        try:
+            return float(tick.get("open") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    def _daily_rows_from_marks(
+        self, syms: List[str], marks: Dict[str, Dict[str, float]]
+    ) -> List[Dict[str, Any]]:
+        """Build Daily board rows; % is always (last - day_open) / day_open * 100."""
+        compute = getattr(KrakenBroker, "compute_daily_pct", None)
+        rows: List[Dict[str, Any]] = []
+        for s in syms:
+            tick = marks.get(s) or {}
+            price = tick.get("last") or tick.get("mid") or tick.get("ask") or tick.get("bid")
+            last = tick.get("last") or tick.get("mid") or price
+            open_px = tick.get("open")
+            pct = None
+            if callable(compute):
+                pct = compute(last, open_px)
+            if pct is None:
+                pct = tick.get("daily_pct")
+                if pct is None:
+                    try:
+                        open_f = float(open_px or 0)
+                        last_f = float(last or 0)
+                        if open_f > 0 and last_f > 0:
+                            pct = (last_f - open_f) / open_f * 100.0
+                    except (TypeError, ValueError):
+                        pct = None
+            try:
+                pct_f = float(pct) if pct is not None else None
+            except (TypeError, ValueError):
+                pct_f = None
+            try:
+                price_f = float(price) if price is not None else None
+            except (TypeError, ValueError):
+                price_f = None
+            rows.append({"symbol": s, "price": price_f, "pct": pct_f})
+        return rows
+
+    async def _status_daily_board_lines(self, symbols: List[str]) -> List[str]:
+        """Daily % board: cache → peek(with day open) → one timed Ticker batch.
+
+        5m OHLC close alone is not enough for daily % — never treat it as a
+        complete mark (that produced n/a or garbage % on /status).
+        """
+        syms = [str(s) for s in (symbols or []) if s]
+        if not syms:
+            return []
+
+        now = time.monotonic()
+        cached = self._daily_pct_cache
+        same = tuple(cached.get("symbols") or ()) == tuple(syms)
+        use_cache = (
+            bool(cached)
+            and same
+            and (now - float(cached.get("ts") or 0)) < _STATUS_DAILY_TTL
+            and cached.get("rows") is not None
+        )
+        if use_cache:
+            rows = list(cached.get("rows") or [])
+        else:
+            marks: Dict[str, Dict[str, float]] = {}
+            peek = getattr(self.broker, "peek_cached_ticker", None)
+            # Prefer last-known *Ticker* marks that include day open.
+            for s in syms:
+                hit = None
+                if callable(peek):
+                    try:
+                        hit = peek(s, max_age=_STATUS_DAILY_MARK_MAX_AGE)
+                    except TypeError:
+                        try:
+                            hit = peek(s)
+                        except Exception:  # noqa: BLE001
+                            hit = None
+                if hit and self._tick_has_day_open(hit):
+                    marks[s] = hit
+
+            missing = [s for s in syms if s not in marks]
+            if missing:
+                getter = getattr(self.broker, "get_tickers", None)
+                try:
+                    if callable(getter):
+                        batch = await asyncio.wait_for(
+                            getter(missing), timeout=_STATUS_FETCH_TIMEOUT
+                        )
+                        if isinstance(batch, dict):
+                            for s, tick in batch.items():
+                                if self._tick_has_day_open(tick):
+                                    marks[s] = tick
+                except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+                    logger.debug("status daily board fetch skipped: %s", exc)
+                    if callable(peek):
+                        for s in missing:
+                            try:
+                                hit = peek(s, max_age=300.0)
+                            except TypeError:
+                                hit = None
+                            if hit and self._tick_has_day_open(hit):
+                                marks[s] = hit
+
+            # Price-only fallback from OHLC when Ticker missed — pct stays n/a.
+            for s in syms:
+                if s in marks:
+                    continue
+                close = self._ohlc_last_close(s)
+                if close and close > 0:
+                    marks[s] = {
+                        "bid": close,
+                        "ask": close,
+                        "last": close,
+                        "mid": close,
+                    }
+
+            if not marks and same and cached.get("rows") is not None:
+                rows = list(cached.get("rows") or [])
+            else:
+                rows = self._daily_rows_from_marks(syms, marks)
+                self._daily_pct_cache = {
+                    "ts": now,
+                    "symbols": tuple(syms),
+                    "rows": rows,
+                }
+
+        try:
+            rot = int(self.ops.extra.get("daily_board_rot") or 0)
+        except (TypeError, ValueError):
+            rot = 0
+        lines, next_rot = format_daily_price_board(rows, rot_index=rot)
+        self.ops.extra["daily_board_rot"] = int(next_rot)
+        return lines
 
     async def _cmd_status(self):
         t0 = time.perf_counter()
@@ -1772,6 +1989,14 @@ class TradingApp:
         elif "rate_limit_cooldown" in self.ops.extra:
             self.ops.extra.pop("rate_limit_cooldown", None)
 
+        daily_board_lines: List[str] = []
+        try:
+            daily_board_lines = await self._status_daily_board_lines(
+                list(status_symbols)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("status daily board skipped: %s", exc)
+
         text = format_status_reply(
             paper_cash=float(bal["cash"]),
             paper_equity=float(bal["equity"]),
@@ -1816,12 +2041,16 @@ class TradingApp:
             circuit_breaker_consec_losses=int(self.risk.consecutive_losses()),
             # Pass 0.0 while CB pause active so /status always shows the clock.
             circuit_breaker_resume_seconds=cb_resume_s if cb_pause_active else None,
+            circuit_breaker_paused=bool(cb_pause_active),
+            phd_weak_bypass_after_cb=bool(self.ops.extra.get("phd_weak_bypass_after_cb")),
             rate_limit_resume_seconds=rl_resume_s if rl_pause_active else None,
             caps_locked=bool(getattr(self.settings, "caps_custom_lock", False)),
             majors_only=bool(getattr(self.settings, "majors_only", True)),
             majors_symbols=majors,
+            daily_board_lines=daily_board_lines or None,
         )
-        parse_mode = "HTML" if (cb_pause_active or rl_pause_active) else None
+        # Plain text only — HTML parse_mode rejects messages with raw <>& elsewhere in /status.
+        parse_mode = None
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         logger.info("status reply built in %.0fms", elapsed_ms)
@@ -1839,9 +2068,109 @@ class TradingApp:
                 self.settings.symbol_list(), mode=self.settings.symbol_mode
             )
 
-        return {STATUS_SYMBOLS_CALLBACK: status_symbols_expand}
+        async def pnl_trades_expand(_data: str):
+            bal = await self.broker.get_balances()
+            return self.notifier.performance_report(bal, paper=self.paper, expanded=True)
+
+        async def pnl_trades_collapse(_data: str):
+            bal = await self.broker.get_balances()
+            return self.notifier.performance_report(bal, paper=self.paper, expanded=False)
+
+        return {
+            STATUS_SYMBOLS_CALLBACK: status_symbols_expand,
+            PNL_TRADES_CALLBACK: pnl_trades_expand,
+            PNL_TRADES_COLLAPSE: pnl_trades_collapse,
+        }
+
+
+    async def _maybe_heal_telegram_listener(self) -> None:
+        """In-process TG listener auto-heal; cooldown 7 min; ping New Guy backup once."""
+        settings = self.settings
+        if not getattr(settings, "telegram_commands_enabled", True):
+            return
+        token = (getattr(settings, "telegram_bot_token", "") or "").strip()
+        # Placeholder token — one-shot New Guy ping
+        if (not token) or token.startswith("YOUR_"):
+            if not self._tg_placeholder_pinged:
+                self._tg_placeholder_pinged = True
+                await self.notifier.send_backup_only(
+                    "trading TG: placeholder token — listener not started; "
+                    "set TELEGRAM_BOT_TOKEN in cruzbot .env (paper uses env -u shell).",
+                    sms=True,
+                )
+            return
+        tg = self.tg
+        if tg is None:
+            return
+        # Dead signals: no successful poll ~100s after start, or repeated 409s, or heartbeat flag
+        age = tg.age_since_ok()
+        conflicts = int(tg.consecutive_409s or 0)
+        hb_dead = False
+        try:
+            import json
+            from pathlib import Path as _P
+            hb = _P(self.heartbeat_path)
+            if hb.is_file():
+                data = json.loads(hb.read_text(encoding="utf-8"))
+                st = str(data.get("tg_listener") or "").lower()
+                hb_dead = st in {"dead", "error"}
+        except Exception:  # noqa: BLE001
+            hb_dead = False
+        need = False
+        reason = ""
+        # Allow ~100s grace (long-poll timeout 25s + backoff)
+        if age > 110.0 and tg.poll_ok_count == 0 and not tg._idle:  # noqa: SLF001
+            need, reason = True, f"no successful poll for {age:.0f}s"
+        elif age > 120.0 and not tg._idle:  # noqa: SLF001
+            need, reason = True, f"stale poll age {age:.0f}s"
+        elif conflicts >= 3:
+            need, reason = True, f"repeated 409s ({conflicts})"
+        elif hb_dead:
+            need, reason = True, "heartbeat tg dead"
+        if not need:
+            return
+        now = time.monotonic()
+        cooldown = 420.0  # 7 minutes
+        if self._tg_heal_last_mono and (now - self._tg_heal_last_mono) < cooldown:
+            logger.debug("tg heal suppressed (cooldown) reason=%s", reason)
+            return
+        self._tg_heal_last_mono = now
+        logger.warning("trading TG auto-heal: restarting listener (%s)", reason)
+        try:
+            old_task = self.tg_task
+            await tg.stop()
+            await tg.close()
+            if old_task and not old_task.done():
+                old_task.cancel()
+                try:
+                    await old_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            self.tg = TelegramCommandListener(
+                self.settings.telegram_bot_token,
+                self.settings.telegram_chat_id,
+                self._wire_telegram_commands(),
+                enabled=True,
+                callback_handlers=self._wire_telegram_callbacks(),
+            )
+            self.notifier.telegram = self.tg
+            self.tg_task = asyncio.create_task(self.tg.run(), name="telegram")
+            await self.notifier.send_backup_only(
+                f"trading TG auto-heal: restarted listener ({reason})",
+                sms=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("tg auto-heal failed")
+            await self.notifier.send_backup_only(
+                f"trading TG auto-heal FAILED: {type(exc).__name__}",
+                sms=True,
+            )
 
     async def start_telegram(self) -> Optional[asyncio.Task]:
+        try:
+            self.notifier.configure_backup()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("backup comms configure failed: %s", exc)
         if not self.settings.telegram_commands_enabled:
             return None
         self.tg = TelegramCommandListener(
@@ -1852,7 +2181,8 @@ class TradingApp:
             callback_handlers=self._wire_telegram_callbacks(),
         )
         self.notifier.telegram = self.tg
-        return asyncio.create_task(self.tg.run(), name="telegram")
+        self.tg_task = asyncio.create_task(self.tg.run(), name="telegram")
+        return self.tg_task
 
     async def shutdown(self) -> None:
         if self.tg:
