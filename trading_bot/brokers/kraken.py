@@ -20,7 +20,7 @@ from trading_bot.utils.retry import with_exponential_backoff
 logger = logging.getLogger(__name__)
 
 # Public REST only while paper; private order endpoints blocked in paper mode.
-_PRIVATE_ORDER_METHODS = {"AddOrder", "CancelOrder", "CancelAll"}
+_PRIVATE_ORDER_METHODS = {"AddOrder", "CancelOrder", "CancelAll", "CancelAllOrdersAfter"}
 
 
 class KrakenBroker(BrokerBase):
@@ -35,6 +35,7 @@ class KrakenBroker(BrokerBase):
         account_equity: float = 1600.0,
         min_public_interval: float = 0.2,
         breaker: Optional[RateLimitBreaker] = None,
+        live_safety: Any = None,
     ):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -44,6 +45,7 @@ class KrakenBroker(BrokerBase):
         self.account_equity = float(account_equity)
         self.min_public_interval = min_public_interval
         self.breaker = breaker
+        self.live_safety = live_safety
         self._last_public = 0.0
         self._client: Optional[httpx.AsyncClient] = None
         self._ticker_cache: Dict[str, Tuple[float, Dict[str, float]]] = {}
@@ -135,6 +137,62 @@ class KrakenBroker(BrokerBase):
                 "(orders simulated locally as kr-paper-…)"
             )
 
+    def note_private_api_result(self, error: Any = None, *, status_code: Optional[int] = None) -> str:
+        """Feed future signed-private results into LIVE safety without logging secrets."""
+        if self.live_safety is None:
+            return "other"
+        if error is None:
+            self.live_safety.note_private_ok()
+            return "ok"
+        return self.live_safety.note_exception(
+            error, source="kraken:private", status_code=status_code
+        )
+
+    def private_signing_available(self) -> bool:
+        """Whether a reviewed Kraken private signing transport is available.
+
+        Credentials alone are intentionally insufficient. This paper-first broker has
+        no private HMAC request implementation, so this remains False until that path
+        is implemented and tested.
+        """
+        return False
+
+    def private_live_path_complete(self) -> bool:
+        """True only after signed AddOrder/Cancel are implemented (not yet)."""
+        return False
+
+    def dead_man_status(self) -> str:
+        from trading_bot.utils.live_safety import DEADMAN_NOT_ARMED, format_dead_man_status
+
+        if not self.private_live_path_complete():
+            return DEADMAN_NOT_ARMED
+        return format_dead_man_status(
+            paper=self.paper,
+            signing_available=self.private_signing_available(),
+            private_path_complete=True,
+        )
+
+    async def cancel_all_orders_after(self, timeout_seconds: int = 60) -> Dict[str, Any]:
+        """Kraken CancelAllOrdersAfter dead-man heartbeat interface.
+
+        This method deliberately issues *no* private request until reviewed signing,
+        live AddOrder, and live Cancel exist. It never fakes an armed/success state.
+        """
+        timeout = int(timeout_seconds)
+        if timeout != 60:
+            return {
+                "ok": False,
+                "armed": False,
+                "timeout": timeout,
+                "status": "not armed — heartbeat must be exactly 60s",
+            }
+        return {
+            "ok": False,
+            "armed": False,
+            "timeout": timeout,
+            "status": self.dead_man_status(),
+        }
+
     async def get_ticker(self, symbol: str) -> Dict[str, float]:
         now = time.time()
         hit = self._ticker_cache.get(symbol)
@@ -151,8 +209,12 @@ class KrakenBroker(BrokerBase):
             last = float(row["c"][0])
             out = {"bid": bid, "ask": ask, "last": last, "mid": (bid + ask) / 2.0}
             self._ticker_cache[symbol] = (now, out)
+            if self.live_safety is not None:
+                self.live_safety.note_ticker_ok(symbol)
             return out
         except Exception as exc:  # noqa: BLE001
+            if self.live_safety is not None:
+                self.live_safety.note_exception(exc, source=f"ticker:{symbol}")
             logger.warning("ticker %s failed: %s — using book fallback", symbol, exc)
             book = self._read_book()
             pos = book.get("positions", {}).get(symbol)
@@ -196,10 +258,14 @@ class KrakenBroker(BrokerBase):
                 tick = {"bid": bid, "ask": ask, "last": last, "mid": (bid + ask) / 2.0}
                 self._ticker_cache[sym] = (now, tick)
                 out[sym] = tick
+                if self.live_safety is not None:
+                    self.live_safety.note_ticker_ok(sym)
             for sym in need:
                 if sym not in out:
                     out[sym] = await self.get_ticker(sym)
         except Exception as exc:  # noqa: BLE001
+            if self.live_safety is not None:
+                self.live_safety.note_exception(exc, source="ticker:batch")
             logger.warning("batch ticker failed: %s — falling back per-symbol", exc)
             for sym in need:
                 out[sym] = await self.get_ticker(sym)

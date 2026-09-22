@@ -122,3 +122,56 @@ python scripts/package_codebase.py --out /tmp/cruzbot_i2_sanitized.zip
 ```
 
 Excludes `.env`, venv, caches, DBs, logs, credential-looking files. Keeps `.env.example`.
+
+### `/live_safety`
+- Reports mode, open-position count, auth/connectivity/stale-mark state, last OK timestamps, entry gate, heartbeat path/PID, and Kraken dead-man status.
+- Enforcement is **LIVE only**. With LIVE positions open, Telegram alerts (5-minute per-kind cooldown):
+  - `🚨 LIVE AUTH FAILURE — open positions require attention`
+  - `🚨 LIVE CONNECTIVITY LOST — open positions may be unmanaged`
+  - `🚨 LIVE STALE MARKS — ...`
+- Any active LIVE auth/connectivity/stale gate pauses **new entries only**; exits/brackets remain attempted.
+- Token-free `data/bot_heartbeat.json` updates each loop with UTC timestamp, mode, PID, and open-position count.
+- Kraken `CancelAllOrdersAfter` 60s heartbeat is scaffolding only and honestly reports `not armed — private live path incomplete`. It does not issue private calls because signed live AddOrder/Cancel remains `NotImplemented`.
+
+Sample:
+
+```text
+🛡 LIVE safety
+mode: PAPER (paper — track only, no pause/alerts)
+positions: 2 open
+entries: allowed (live-only pause)
+auth: OK  (consec=0, last OK never)
+connectivity: OK  (consec=0, last OK 1s ago)
+stale marks: OK  (ticker age 1s, gate 45s, only while positions open)
+last private OK: never
+dead-man: not armed — private live path incomplete
+heartbeat: /workspace/cruzbot_instance_2/data/bot_heartbeat.json (pid 12345)
+alerts: live+open-positions only; 5m cooldown
+```
+
+### `/future_pack`
+- Reads current close count, expectancy, and current formula score; labels each deferred item `WAIT`, `READY`, or `DONE`.
+- Persistent runtime state is `data/future_pack.json` (gitignored); canonical notes/gates are in `FUTURE_PACK.md`.
+- Formula score in the 70s is a deadline/readiness goal, **not permission** to auto-implement risky features. It never changes trading knobs.
+- If score is ≥65 and any prerequisite remains `WAIT`, it shows `🚨 URGENT — Before health score is in the 70s` without pretending the pack is complete.
+- `v` does **not** greenlight regime-scaled size. Live safety alerts/heartbeat are `DONE`; dead-man remains `WAIT` until signed private Kraken AddOrder/Cancel exists.
+
+Sample:
+
+```text
+📦 Future Pack readiness
+formula: 🟡 48  ·  closes=2  ·  expectancy=$-1.38/trade
+(score in the 70s is a deadline/goal — not permission to auto-implement)
+
+• WAIT  Regime-scaled size
+    2 closes; no explicit greenlight; no clean paper week ("v" ignored)
+• WAIT  Maker-first + signed AddOrder/Cancel + dead-man
+    blocked: live signed AddOrder is NotImplemented; dead-man not armed
+• DONE  LIVE safety alerts + heartbeat file
+    shipped: LIVE alerts + data/bot_heartbeat.json
+• WAIT  Kraken CancelAllOrdersAfter dead-man
+    not armed — private live path incomplete
+
+Blocked prerequisite: live signed AddOrder (NotImplemented).
+Do not auto-edit trading knobs. "v" is not a greenlight.
+```

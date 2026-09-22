@@ -42,3 +42,12 @@ class BrokerBase(ABC):
     @abstractmethod
     async def get_balances(self) -> Dict[str, Any]:
         ...
+
+    @abstractmethod
+    async def cancel_all_orders_after(self, timeout_seconds: int = 60) -> Dict[str, Any]:
+        """Refresh exchange dead-man timer, or report honestly that it is unavailable."""
+        ...
+
+    @abstractmethod
+    def dead_man_status(self) -> str:
+        ...

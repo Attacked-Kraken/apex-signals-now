@@ -104,6 +104,8 @@ BOT_COMMAND_SPECS: List[Tuple[str, str]] = [
     ("phd_mode", "Alias for /phd"),
     ("quant", "Session risk metrics + DD gate"),
     ("quant_metrics", "Alias for /quant"),
+    ("live_safety", "LIVE safety + dead-man status"),
+    ("future_pack", "Deferred pack readiness gates"),
     ("universe", "Crypto universe mode"),
     ("universe_all", "Kraken discovery"),
     ("universe_stocks", "Toggle xStocks"),

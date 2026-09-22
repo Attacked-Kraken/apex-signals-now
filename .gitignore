@@ -24,3 +24,5 @@ data/formula_memory.json
 data/wf_*_snapshot.json
 data/active_params_2.json
 !data/.gitkeep
+data/future_pack.json
+data/bot_heartbeat.json

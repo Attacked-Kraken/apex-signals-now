@@ -23,11 +23,13 @@ class DataFeed:
         min_interval: float = 0.2,
         cache_ttl: float = 8.0,
         breaker: Optional[RateLimitBreaker] = None,
+        live_safety: Any = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.min_interval = min_interval
         self.cache_ttl = float(cache_ttl)
         self.breaker = breaker
+        self.live_safety = live_safety
         self._last = 0.0
         self._lock = asyncio.Lock()
         self._client: Optional[httpx.AsyncClient] = None
@@ -108,12 +110,16 @@ class DataFeed:
             self._cache[cache_key] = (now, bars)
             if self.breaker is not None:
                 self.breaker.record_success()
+            if self.live_safety is not None:
+                self.live_safety.note_connectivity_ok()
             return bars
         except RateLimitError as exc:
             # breaker already updated via on_rate_limit during retries
             logger.warning("OHLC %s rate-limited: %s", symbol, exc)
             return hit[1] if hit else []
         except Exception as exc:  # noqa: BLE001
+            if self.live_safety is not None:
+                self.live_safety.note_exception(exc, source=f"ohlc:{symbol}")
             logger.warning("OHLC %s failed: %s", symbol, exc)
             return hit[1] if hit else []
 

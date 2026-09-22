@@ -45,6 +45,18 @@ from trading_bot.utils.quant_metrics import (
     update_equity_peak,
 )
 from trading_bot.utils.order_rate_limit import OrderRateLimiter
+from trading_bot.utils.live_safety import (
+    LiveSafetyTracker,
+    default_heartbeat_path,
+    format_live_safety_report,
+    write_bot_heartbeat,
+)
+from trading_bot.utils.future_pack import (
+    default_future_pack_path,
+    evaluate_future_pack,
+    format_future_pack_report,
+    mark_detected_capabilities,
+)
 from trading_bot.strategy import check_daily_drawdown_circuit
 from trading_bot.strategy_volume_sweet_spot import VolumeSweetSpotStrategy
 from trading_bot.telegram_commands import (
@@ -177,6 +189,9 @@ class TradingApp:
             ),
         )
         self.ban_risk = BanRiskTracker()
+        self.live_safety = LiveSafetyTracker()
+        self.heartbeat_path = default_heartbeat_path(settings)
+        self.future_pack_path = default_future_pack_path(settings)
         self.rate_breaker.ban_risk = self.ban_risk
         self.rate_breaker.set_on_trip(self.ban_risk.note_breaker_trip)
         min_interval = float(getattr(settings, "kraken_public_min_interval", 0.4) or 0.4)
@@ -189,12 +204,14 @@ class TradingApp:
             account_equity=settings.account_equity,
             min_public_interval=min_interval,
             breaker=self.rate_breaker,
+            live_safety=self.live_safety,
         )
         self.data_feed = DataFeed(
             base_url=settings.kraken_base_url,
             min_interval=min_interval,
             cache_ttl=float(getattr(settings, "ohlc_cache_seconds", 20.0) or 20.0),
             breaker=self.rate_breaker,
+            live_safety=self.live_safety,
         )
         self.strategy = VolumeSweetSpotStrategy(settings)
         self.agent = AgentCore(settings, self.data_feed, self.strategy)
@@ -226,6 +243,7 @@ class TradingApp:
         self.tg: Optional[TelegramCommandListener] = None
         self.notifier = Notifier()
         self._pending_maker_time_exits: Dict[str, Dict[str, Any]] = {}
+        mark_detected_capabilities(path=self.future_pack_path, broker=self.broker)
         self._enforce_winning_formula_sl()
         self._apply_live_pacing()
 
@@ -247,6 +265,45 @@ class TradingApp:
             iv,
             cache,
         )
+
+    def _dead_man_status(self) -> str:
+        return self.broker.dead_man_status()
+
+    async def _update_safety_heartbeat(self, positions: Optional[List[Any]] = None) -> List[Any]:
+        """Write token-free heartbeat; arm dead-man only after private path is complete."""
+        if positions is None:
+            try:
+                positions = await self.broker.get_positions()
+            except Exception as exc:  # noqa: BLE001
+                self.live_safety.note_exception(exc, source="positions")
+                positions = []
+        write_bot_heartbeat(
+            self.heartbeat_path,
+            mode="PAPER" if self.paper else "LIVE",
+            pid=os.getpid(),
+            open_positions=len(positions),
+            extra={"dead_man": self._dead_man_status()},
+        )
+        # Scaffolding only. Both checks are False until signed AddOrder/Cancel exists.
+        if (
+            not self.paper
+            and self.broker.private_signing_available()
+            and self.broker.private_live_path_complete()
+        ):
+            result = await self.broker.cancel_all_orders_after(60)
+            if not result.get("armed"):
+                logger.error("dead-man heartbeat failed: %s", result.get("status"))
+        return positions
+
+    async def _live_safety_housekeeping(self, positions: Optional[List[Any]] = None) -> List[Any]:
+        positions = await self._update_safety_heartbeat(positions)
+        alerts = self.live_safety.consume_alerts(
+            live=not self.paper,
+            positions_open=bool(positions),
+        )
+        for alert in alerts:
+            await self.notifier.send(alert)
+        return positions
 
     def _enforce_winning_formula_sl(self) -> None:
         if self.settings.winning_formula:
@@ -490,8 +547,12 @@ class TradingApp:
 
     async def run_once(self) -> None:
         self.ops.touch_tick()
-        # Always manage exits/brackets even during rate-limit cooldown
+        # Heartbeat every loop, including PAPER. Token-free external-supervisor hook.
+        await self._update_safety_heartbeat()
+        # Always manage exits/brackets even when new entries are safety-paused.
         await self._check_hard_brackets()
+        # Ticker hooks above refresh freshness; alerts are LIVE + open positions only.
+        await self._live_safety_housekeeping()
 
         if self.rate_breaker.cooling_down():
             rem = self.rate_breaker.remaining_seconds()
@@ -566,11 +627,19 @@ class TradingApp:
             settings=self.settings, paper=self.paper, breaker=self.rate_breaker
         )
         pause_entries = False
-        if bool(getattr(self.settings, "api_risk_pause_on_high", True)) and risk_snap.get("band") == "HIGH":
+        live_safety_reason = self.live_safety.entry_block_reason(
+            live=not self.paper,
+            positions_open=bool(positions),
+        )
+        if live_safety_reason:
+            pause_entries = True
+            self.ops.focus_blocked = live_safety_reason
+            logger.error("%s; exits remain enabled", live_safety_reason)
+        if (not pause_entries) and bool(getattr(self.settings, "api_risk_pause_on_high", True)) and risk_snap.get("band") == "HIGH":
             pause_entries = True
             self.ops.focus_blocked = f"api_risk HIGH ({risk_snap.get('score')}/100) — new entries paused"
             logger.warning("%s", self.ops.focus_blocked)
-        elif bool(getattr(self.settings, "api_risk_pause_on_medium", False)) and risk_snap.get("band") == "MEDIUM":
+        elif (not pause_entries) and bool(getattr(self.settings, "api_risk_pause_on_medium", False)) and risk_snap.get("band") == "MEDIUM":
             pause_entries = True
             self.ops.focus_blocked = f"api_risk MEDIUM ({risk_snap.get('score')}/100) — new entries paused"
 
@@ -658,8 +727,14 @@ class TradingApp:
         while not self.ops.kill_requested:
             try:
                 await self.run_once()
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                self.live_safety.note_exception(exc, source="loop")
                 logger.exception("loop iteration failed")
+            finally:
+                try:
+                    await self._live_safety_housekeeping()
+                except Exception:  # noqa: BLE001
+                    logger.exception("live-safety heartbeat/alert housekeeping failed")
             if self.paper:
                 poll = float(self.settings.agent_poll_seconds or 1.0)
             else:
@@ -1268,6 +1343,32 @@ class TradingApp:
             snap = self._evaluate_formula_snap(bal)
             return format_formula_report(snap)
 
+        async def live_safety_cmd(_c: str, _args: List[str]) -> str:
+            positions = await self._update_safety_heartbeat()
+            snap = self.live_safety.snapshot(
+                live=not self.paper,
+                positions_open=len(positions),
+                dead_man=self._dead_man_status(),
+                heartbeat_path=self.heartbeat_path,
+                pid=os.getpid(),
+            )
+            return format_live_safety_report(snap)
+
+        async def future_pack_cmd(_c: str, _args: List[str]) -> str:
+            bal = await self.broker.get_balances()
+            snap = self._evaluate_formula_snap(dict(bal))
+            metrics = snap.get("metrics") or {}
+            pack = evaluate_future_pack(
+                closed_trades=bal.get("closed_trades") or [],
+                formula_score=int(snap.get("score") or 0),
+                expectancy=float(metrics.get("expectancy") or 0.0),
+                n_closes=int(metrics.get("closed_trades_n") or 0),
+                path=self.future_pack_path,
+                broker=self.broker,
+                settings=self.settings,
+            )
+            return format_future_pack_report(pack)
+
         async def quant(_c: str, _args: List[str]) -> str:
             bal = await self.broker.get_balances()
             band = None
@@ -1355,6 +1456,8 @@ class TradingApp:
             "phd_mode": phd,
             "quant": quant,
             "quant_metrics": quant,
+            "live_safety": live_safety_cmd,
+            "future_pack": future_pack_cmd,
             "stop_loss": stop_loss,
             "winning_formula": winning_formula,
             "aggressive": aggressive,
