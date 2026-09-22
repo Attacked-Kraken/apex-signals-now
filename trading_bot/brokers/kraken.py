@@ -50,6 +50,8 @@ class KrakenBroker(BrokerBase):
         self._client: Optional[httpx.AsyncClient] = None
         self._ticker_cache: Dict[str, Tuple[float, Dict[str, float]]] = {}
         self._ticker_cache_ttl = 1.0
+        # Longer stale-ok window for /status (prefer last-known over blocking).
+        self._status_mark_max_age = 8.0
         self._ensure_book(account_equity)
 
     def _ensure_book(self, equity: float) -> None:
@@ -192,6 +194,22 @@ class KrakenBroker(BrokerBase):
             "timeout": timeout,
             "status": self.dead_man_status(),
         }
+
+    def peek_cached_ticker(
+        self, symbol: str, *, max_age: Optional[float] = None
+    ) -> Optional[Dict[str, float]]:
+        """Return a cached ticker if younger than max_age (default: status window)."""
+        hit = self._ticker_cache.get(symbol)
+        if not hit:
+            return None
+        age_limit = self._ticker_cache_ttl if max_age is None else float(max_age)
+        if time.time() - hit[0] < age_limit:
+            return hit[1]
+        return None
+
+    def cache_ticker(self, symbol: str, tick: Dict[str, float]) -> None:
+        """Seed/refresh ticker cache (e.g. OHLC last close for /status)."""
+        self._ticker_cache[symbol] = (time.time(), dict(tick))
 
     async def get_ticker(self, symbol: str) -> Dict[str, float]:
         now = time.time()
@@ -430,15 +448,42 @@ class KrakenBroker(BrokerBase):
             pos["tp"] = tp
         self._write_book(book)
 
-    async def get_balances(self) -> Dict[str, Any]:
+    async def get_balances(
+        self,
+        *,
+        marks: Optional[Dict[str, Dict[str, float]]] = None,
+        prefer_cache_max_age: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Paper book balances. Marks: one batch fetch (or caller-supplied / cache)."""
         book = self._read_book()
         cash = float(book.get("cash", 0))
         positions = await self.get_positions()
         exposure = 0.0
-        for p in positions:
-            ticker = await self.get_ticker(p.symbol)
-            mark = float(ticker.get("mid") or p.entry)
-            exposure += abs(p.qty * mark)
+        if positions:
+            if marks is None:
+                syms = [p.symbol for p in positions]
+                # Prefer fresh-enough cached marks to avoid serial public polls.
+                age = (
+                    float(prefer_cache_max_age)
+                    if prefer_cache_max_age is not None
+                    else float(self._status_mark_max_age)
+                )
+                cached: Dict[str, Dict[str, float]] = {}
+                need: List[str] = []
+                for sym in syms:
+                    hit = self.peek_cached_ticker(sym, max_age=age)
+                    if hit is not None:
+                        cached[sym] = hit
+                    else:
+                        need.append(sym)
+                if need:
+                    fetched = await self.get_tickers(need)
+                    cached.update(fetched)
+                marks = cached
+            for p in positions:
+                ticker = (marks or {}).get(p.symbol) or {}
+                mark = float(ticker.get("mid") or p.entry)
+                exposure += abs(p.qty * mark)
         equity = cash + exposure
         closed = book.get("closed_trades") or []
         wins = sum(1 for t in closed if t.get("won"))

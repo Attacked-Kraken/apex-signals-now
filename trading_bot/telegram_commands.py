@@ -889,21 +889,19 @@ def format_status_reply(
         f"(⚠️☣️circuit breaker ☣️⚠️) {cb_state} · {cl} consecutive loss"
         f"{'' if cl == 1 else 'es'}"
     )
-    try:
-        cb_rem = float(circuit_breaker_resume_seconds or 0.0)
-    except (TypeError, ValueError):
-        cb_rem = 0.0
-    if cb_rem > 0.5:
-        lines.append(
-            format_trading_resume_countdown_line(
-                cb_rem, kind="circuit breaker pause"
-            )
-        )
-    try:
-        rl_rem = float(rate_limit_resume_seconds or 0.0)
-    except (TypeError, ValueError):
-        rl_rem = 0.0
-    if rl_rem > 0.5:
+    # Always show loud clock countdown when CB pause is active (incl. 00:00).
+    # None = not in CB pause; any float (incl. 0) = show clock under the CB line.
+    if circuit_breaker_resume_seconds is not None:
+        try:
+            cb_rem = float(circuit_breaker_resume_seconds)
+        except (TypeError, ValueError):
+            cb_rem = 0.0
+        lines.append(format_trading_resume_countdown_line(cb_rem, kind=""))
+    if rate_limit_resume_seconds is not None:
+        try:
+            rl_rem = float(rate_limit_resume_seconds)
+        except (TypeError, ValueError):
+            rl_rem = 0.0
         lines.append(
             format_trading_resume_countdown_line(
                 rl_rem, kind="API rate-limit / 429 pause"
@@ -1464,15 +1462,14 @@ def format_circuity_breaker_status(
         bits.append("losses still counted — no auto pause; /resume if paused")
     if tripped:
         bits.append("TRIPPED (paused) — /resume to trade")
-    try:
-        rem = float(resume_seconds or 0.0)
-    except (TypeError, ValueError):
-        rem = 0.0
     body = " · ".join(bits)
-    if rem > 0.5:
-        body = body + "\n" + format_trading_resume_countdown_line(
-            rem, kind="circuit breaker pause"
-        )
+    # Show countdown whenever caller supplies resume_seconds (incl. 0 while tripped).
+    if resume_seconds is not None or tripped:
+        try:
+            rem = float(resume_seconds if resume_seconds is not None else 0.0)
+        except (TypeError, ValueError):
+            rem = 0.0
+        body = body + "\n" + format_trading_resume_countdown_line(rem, kind="")
     return body
 
 

@@ -160,6 +160,10 @@ _TIME_EXIT_FEE_CUSHION_PCT = 0.0125
 _TIME_EXIT_MAKER_WAIT_SEC = 300.0
 MAJORS_ONLY_DEFAULT = ("BTC-USD", "ETH-USD", "SOL-USD", "LINK-USD", "XCN-USD")
 ENV_PATH = ROOT / ".env"
+# /status delivery: prefer last-known marks over blocking Kraken polls.
+_STATUS_MARK_MAX_AGE = 8.0
+_STATUS_SNAP_TTL = 4.0
+_STATUS_FETCH_TIMEOUT = 1.25
 
 
 class TradingApp:
@@ -170,7 +174,13 @@ class TradingApp:
         self.ops = OpsState(
             paused=settings.paused,
             cb_enabled=bool(getattr(settings, "circuit_breaker_enabled", True)),
+            cb_state_path=ROOT / "data" / "cb_auto_resume.json",
         )
+        # Wall-clock CB cooldown survives restarts; monotonic alone does not.
+        try:
+            self.ops.restore_cb_state_from_disk()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CB state restore failed: %s", exc)
         self.paper = bool(settings.paper_trading_mode) and not (
             force_live_cli and not settings.paper_trading_mode
         )
@@ -190,6 +200,8 @@ class TradingApp:
         )
         self.ban_risk = BanRiskTracker()
         self.live_safety = LiveSafetyTracker()
+        # Last-known /status market snapshot (marks/PnL/formula) for fast replies.
+        self._status_snap_cache: Dict[str, Any] = {}
         self.heartbeat_path = default_heartbeat_path(settings)
         self.future_pack_path = default_future_pack_path(settings)
         self.rate_breaker.ban_risk = self.ban_risk
@@ -222,6 +234,15 @@ class TradingApp:
                 self.ops.arm_cb_auto_resume()
 
         self.risk.set_ops(_cb_pause, lambda m: asyncio.create_task(self.notifier.send(m)))
+        # Hydrate streak from paper book so /status matches persisted losses.
+        # Do NOT re-arm CB from streak alone — /resume leaves consec intact and must stick.
+        try:
+            if hasattr(self.broker, "_read_book"):
+                _book = self.broker._read_book()  # noqa: SLF001
+                _cl = int((_book or {}).get("consecutive_losses") or 0)
+                self.risk.set_consecutive_losses(_cl)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("consec hydrate skipped: %s", exc)
         self.order_limiter = OrderRateLimiter(
             max_per_minute=int(getattr(settings, "live_max_orders_per_minute", 6) or 6)
         )
@@ -771,7 +792,9 @@ class TradingApp:
     def _formula_memory_path(self) -> Path:
         return default_formula_memory_path(self.settings)
 
-    def _evaluate_formula_snap(self, bal: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _evaluate_formula_snap(
+        self, bal: Optional[Dict[str, Any]] = None, *, persist: bool = True
+    ) -> Dict[str, Any]:
         """Compute formula health snap from broker/settings/ops (suggest-only)."""
         if bal is None:
             bal = {}
@@ -823,10 +846,11 @@ class TradingApp:
             closed_trades=closed,
             cash=float(bal["cash"]) if bal.get("cash") is not None else None,
         )
-        try:
-            record_snapshot(self._formula_memory_path(), snap)
-        except Exception as exc:  # noqa: BLE001
-            logging.getLogger(__name__).debug("formula memory write failed: %s", exc)
+        if persist:
+            try:
+                record_snapshot(self._formula_memory_path(), snap)
+            except Exception as exc:  # noqa: BLE001
+                logging.getLogger(__name__).debug("formula memory write failed: %s", exc)
         return snap
 
     # --- Telegram wiring ---
@@ -1386,7 +1410,10 @@ class TradingApp:
                 return CIRCUITY_BREAKER_USAGE
             enabled = bool(getattr(self.settings, "circuit_breaker_enabled", True))
             consec = int(self.risk.consecutive_losses())
-            tripped = bool(self.ops.paused and getattr(self.ops, "cb_active", False))
+            try:
+                tripped = bool(self.ops.cb_pause_active())
+            except Exception:  # noqa: BLE001
+                tripped = bool(self.ops.paused and getattr(self.ops, "cb_active", False))
             if action == "status":
                 rem = 0.0
                 if tripped:
@@ -1398,9 +1425,9 @@ class TradingApp:
                     enabled=enabled,
                     consec=consec,
                     tripped=tripped,
-                    resume_seconds=rem if rem > 0.5 else None,
+                    resume_seconds=rem if tripped else None,
                 )
-                if rem > 0.5:
+                if tripped:
                     return TelegramReply(text=msg, parse_mode="HTML")
                 return msg
             on = action == "on"
@@ -1499,15 +1526,112 @@ class TradingApp:
             "help": help_cmd,
         }
 
-    async def _cmd_status(self):
-        bal = await self.broker.get_balances()
+    def _ohlc_last_close(self, symbol: str) -> Optional[float]:
+        """Best-effort last close from DataFeed cache (no network)."""
+        cache = getattr(self.data_feed, "_cache", None) or {}
+        for interval in (5, 1, 15):
+            hit = cache.get(f"{symbol}:{interval}")
+            if not hit:
+                continue
+            bars = hit[1] if isinstance(hit, tuple) and len(hit) > 1 else None
+            if not bars:
+                continue
+            try:
+                return float(bars[-1].get("c") or 0) or None
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    async def _status_resolve_marks(self, symbols: List[str]) -> Dict[str, Dict[str, float]]:
+        """Resolve marks for /status: cache → OHLC close → one batched fetch (timed)."""
+        out: Dict[str, Dict[str, float]] = {}
+        need: List[str] = []
+        peek = getattr(self.broker, "peek_cached_ticker", None)
+        cache_put = getattr(self.broker, "cache_ticker", None)
+        for sym in symbols:
+            if not sym:
+                continue
+            hit = None
+            if callable(peek):
+                try:
+                    hit = peek(sym, max_age=_STATUS_MARK_MAX_AGE)
+                except TypeError:
+                    hit = peek(sym)
+            if hit:
+                out[sym] = hit
+                continue
+            close = self._ohlc_last_close(sym)
+            if close and close > 0:
+                tick = {"bid": close, "ask": close, "last": close, "mid": close}
+                out[sym] = tick
+                if callable(cache_put):
+                    try:
+                        cache_put(sym, tick)
+                    except Exception:  # noqa: BLE001
+                        pass
+                continue
+            need.append(sym)
+        if not need:
+            return out
+        getter = getattr(self.broker, "get_tickers", None)
+        try:
+            if callable(getter):
+                batch = await asyncio.wait_for(
+                    getter(need), timeout=_STATUS_FETCH_TIMEOUT
+                )
+                if isinstance(batch, dict):
+                    out.update(batch)
+            else:
+                # Fallback: parallel single-ticker with overall budget
+                async def _one(s: str) -> Tuple[str, Dict[str, float]]:
+                    t = await self.broker.get_ticker(s)
+                    return s, t
+
+                done = await asyncio.wait_for(
+                    asyncio.gather(*[_one(s) for s in need], return_exceptions=True),
+                    timeout=_STATUS_FETCH_TIMEOUT,
+                )
+                for item in done:
+                    if isinstance(item, tuple) and len(item) == 2:
+                        out[item[0]] = item[1]
+        except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+            logger.debug("status mark fetch skipped/slow: %s", exc)
+            # Stale cache as last resort (any age)
+            for sym in need:
+                if sym in out:
+                    continue
+                if callable(peek):
+                    try:
+                        stale = peek(sym, max_age=300.0)
+                    except TypeError:
+                        stale = None
+                    if stale:
+                        out[sym] = stale
+        return out
+
+    async def _status_market_snapshot(self) -> Dict[str, Any]:
+        """Balances + position marks + focus px; cached briefly for fast /status."""
+        now = time.monotonic()
+        cached = self._status_snap_cache
+        if cached and (now - float(cached.get("ts") or 0)) < _STATUS_SNAP_TTL:
+            return cached
+
         positions = await self.broker.get_positions()
-        thresh, note = self._effective_entry_threshold()
-        sl_pct, _tp, clamped = self._profile_sl_tp_pct()
+        focus_sym = self.ops.focus_symbol or None
+        want = [p.symbol for p in positions]
+        if focus_sym and focus_sym not in want:
+            want.append(focus_sym)
+
+        marks = await self._status_resolve_marks(want)
+        # Single equity pass using resolved marks (no second Kraken round-trip).
+        try:
+            bal = await self.broker.get_balances(marks=marks, prefer_cache_max_age=_STATUS_MARK_MAX_AGE)
+        except TypeError:
+            bal = await self.broker.get_balances()
 
         pos_rows = []
         for p in positions:
-            tkr = await self.broker.get_ticker(p.symbol)
+            tkr = marks.get(p.symbol) or {}
             mark = float(tkr.get("mid") or p.entry)
             upl = (mark - p.entry) * p.qty if p.side != "short" else (p.entry - mark) * p.qty
             pos_rows.append(
@@ -1524,11 +1648,59 @@ class TradingApp:
                 }
             )
 
-        focus_sym = self.ops.focus_symbol or None
         focus_px = None
         if focus_sym:
-            tkr = await self.broker.get_ticker(focus_sym)
+            tkr = marks.get(focus_sym) or {}
             focus_px = float(tkr.get("mid") or 0) or None
+
+        _formula_bal = dict(bal)
+        _formula_bal["positions_count"] = len(pos_rows)
+        # Skip formula_memory disk write on the hot /status path.
+        _formula = self._evaluate_formula_snap(_formula_bal, persist=False)
+        quant_line = None
+        if bool(getattr(self.settings, "quant_metrics_on_status", True)):
+            try:
+                _q = self._quant_snapshot(
+                    bal, formula_band=str(_formula.get("band") or "") or None
+                )
+                quant_line = _q.get("status_line")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("quant status line skipped: %s", exc)
+
+        snap = {
+            "ts": now,
+            "bal": bal,
+            "pos_rows": pos_rows,
+            "focus_sym": focus_sym,
+            "focus_px": focus_px,
+            "formula": _formula,
+            "quant_line": quant_line,
+        }
+        self._status_snap_cache = snap
+
+        # Best-snapshot save is nice-to-have; never block delivery.
+        try:
+            maybe_save_wf_best_snapshot(
+                self.settings,
+                _formula,
+                env_path=ENV_PATH if ENV_PATH.exists() else None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("winning_formula snapshot save failed: %s", exc)
+        return snap
+
+    async def _cmd_status(self):
+        t0 = time.perf_counter()
+        snap = await self._status_market_snapshot()
+        bal = snap["bal"]
+        pos_rows = snap["pos_rows"]
+        focus_sym = snap.get("focus_sym") or self.ops.focus_symbol or None
+        focus_px = snap.get("focus_px")
+        _formula = snap.get("formula") or {}
+        quant_line = snap.get("quant_line")
+
+        thresh, note = self._effective_entry_threshold()
+        sl_pct, _tp, clamped = self._profile_sl_tp_pct()
 
         market = self.regime.state.label or "n/a"
         if self._short_bias() and "BIAS=" not in market.upper():
@@ -1574,38 +1746,27 @@ class TradingApp:
         _risk = self.ban_risk.evaluate(
             settings=self.settings, paper=self.paper, breaker=self.rate_breaker
         )
-        _formula_bal = dict(bal)
-        _formula_bal["positions_count"] = len(pos_rows)
-        _formula = self._evaluate_formula_snap(_formula_bal)
+
+        # Countdown clocks always refreshed from live ops (never stale-cached).
+        cb_pause_active = False
         try:
-            maybe_save_wf_best_snapshot(
-                self.settings,
-                _formula,
-                env_path=ENV_PATH if ENV_PATH.exists() else None,
+            cb_pause_active = bool(self.ops.cb_pause_active())
+        except Exception:  # noqa: BLE001
+            cb_pause_active = bool(self.ops.paused) and (
+                bool(getattr(self.ops, "cb_auto_resume_armed", False))
+                or bool(getattr(self.ops, "cb_active", False))
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("winning_formula snapshot save failed: %s", exc)
-        quant_line = None
-        if bool(getattr(self.settings, "quant_metrics_on_status", True)):
-            try:
-                _q = self._quant_snapshot(
-                    bal, formula_band=str(_formula.get("band") or "") or None
-                )
-                quant_line = _q.get("status_line")
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("quant status line skipped: %s", exc)
         cb_resume_s = 0.0
-        if self.ops.paused and (
-            getattr(self.ops, "cb_auto_resume_armed", False)
-            or getattr(self.ops, "cb_active", False)
-        ):
+        if cb_pause_active:
             try:
                 cb_resume_s = float(self.ops.cb_auto_resume_remaining_seconds())
             except Exception:  # noqa: BLE001
                 cb_resume_s = 0.0
 
         rl_resume_s = 0.0
+        rl_pause_active = False
         if self.rate_breaker.cooling_down():
+            rl_pause_active = True
             rl_resume_s = float(self.rate_breaker.remaining_seconds())
             self.ops.extra["rate_limit_cooldown"] = rl_resume_s
         elif "rate_limit_cooldown" in self.ops.extra:
@@ -1653,13 +1814,17 @@ class TradingApp:
             quant_line=quant_line,
             circuit_breaker_on=cb_enabled,
             circuit_breaker_consec_losses=int(self.risk.consecutive_losses()),
-            circuit_breaker_resume_seconds=cb_resume_s if cb_resume_s > 0.5 else None,
-            rate_limit_resume_seconds=rl_resume_s if rl_resume_s > 0.5 else None,
+            # Pass 0.0 while CB pause active so /status always shows the clock.
+            circuit_breaker_resume_seconds=cb_resume_s if cb_pause_active else None,
+            rate_limit_resume_seconds=rl_resume_s if rl_pause_active else None,
             caps_locked=bool(getattr(self.settings, "caps_custom_lock", False)),
             majors_only=bool(getattr(self.settings, "majors_only", True)),
             majors_symbols=majors,
         )
-        parse_mode = "HTML" if (cb_resume_s > 0.5 or rl_resume_s > 0.5) else None
+        parse_mode = "HTML" if (cb_pause_active or rl_pause_active) else None
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        logger.info("status reply built in %.0fms", elapsed_ms)
 
         n = len(list(status_symbols or []))
         if n > 0:

@@ -17,16 +17,42 @@ def format_countdown_duration(seconds: float) -> str:
     return f"{sec}s"
 
 
+def format_countdown_clock(seconds: float) -> str:
+    """Zero-padded clock remaining time: MM:SS or H:MM:SS."""
+    try:
+        s = max(0, int(round(float(seconds))))
+    except (TypeError, ValueError):
+        s = 0
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{sec:02d}"
+    return f"{m:02d}:{sec:02d}"
+
+
+def format_alarm_clock_countdown(seconds: float, *, bold: bool = True) -> str:
+    """Loud clock motif: ⏰⏰   MM:SS   ⏰⏰ (time optionally HTML-bold)."""
+    clock = format_countdown_clock(seconds)
+    time_s = f"<b>{clock}</b>" if bold else clock
+    return f"⏰⏰   {time_s}   ⏰⏰"
+
+
 def format_trading_resume_countdown_line(
     seconds: float,
     *,
     kind: str = "",
     bold: bool = True,
 ) -> str:
-    """User-facing pause countdown; TIME is bold via Telegram HTML <b> when bold=True."""
-    t = format_countdown_duration(seconds)
-    time_s = f"<b>{t}</b>" if bold else t
+    """User-facing pause countdown as a highly noticeable clock block.
+
+    Example:
+      ⏰⏰   <b>44:12</b>   ⏰⏰
+      time until trading starts again
+    """
+    clock_line = format_alarm_clock_countdown(seconds, bold=bold)
     kind_s = str(kind or "").strip()
     if kind_s:
-        return f"⏱ {kind_s} — time until trading starts again: {time_s}"
-    return f"⏱ time until trading starts again: {time_s}"
+        caption = f"{kind_s} — time until trading starts again"
+    else:
+        caption = "time until trading starts again"
+    return f"{clock_line}\n{caption}"
