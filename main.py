@@ -1388,9 +1388,21 @@ class TradingApp:
             consec = int(self.risk.consecutive_losses())
             tripped = bool(self.ops.paused and getattr(self.ops, "cb_active", False))
             if action == "status":
-                return format_circuity_breaker_status(
-                    enabled=enabled, consec=consec, tripped=tripped
+                rem = 0.0
+                if tripped:
+                    try:
+                        rem = float(self.ops.cb_auto_resume_remaining_seconds())
+                    except Exception:  # noqa: BLE001
+                        rem = 0.0
+                msg = format_circuity_breaker_status(
+                    enabled=enabled,
+                    consec=consec,
+                    tripped=tripped,
+                    resume_seconds=rem if rem > 0.5 else None,
                 )
+                if rem > 0.5:
+                    return TelegramReply(text=msg, parse_mode="HTML")
+                return msg
             on = action == "on"
             # Mark trip state when pausing via CB path so status can show TRIPPED.
             if on and self.ops.paused:
@@ -1582,6 +1594,23 @@ class TradingApp:
                 quant_line = _q.get("status_line")
             except Exception as exc:  # noqa: BLE001
                 logger.debug("quant status line skipped: %s", exc)
+        cb_resume_s = 0.0
+        if self.ops.paused and (
+            getattr(self.ops, "cb_auto_resume_armed", False)
+            or getattr(self.ops, "cb_active", False)
+        ):
+            try:
+                cb_resume_s = float(self.ops.cb_auto_resume_remaining_seconds())
+            except Exception:  # noqa: BLE001
+                cb_resume_s = 0.0
+
+        rl_resume_s = 0.0
+        if self.rate_breaker.cooling_down():
+            rl_resume_s = float(self.rate_breaker.remaining_seconds())
+            self.ops.extra["rate_limit_cooldown"] = rl_resume_s
+        elif "rate_limit_cooldown" in self.ops.extra:
+            self.ops.extra.pop("rate_limit_cooldown", None)
+
         text = format_status_reply(
             paper_cash=float(bal["cash"]),
             paper_equity=float(bal["equity"]),
@@ -1624,19 +1653,20 @@ class TradingApp:
             quant_line=quant_line,
             circuit_breaker_on=cb_enabled,
             circuit_breaker_consec_losses=int(self.risk.consecutive_losses()),
+            circuit_breaker_resume_seconds=cb_resume_s if cb_resume_s > 0.5 else None,
+            rate_limit_resume_seconds=rl_resume_s if rl_resume_s > 0.5 else None,
             caps_locked=bool(getattr(self.settings, "caps_custom_lock", False)),
             majors_only=bool(getattr(self.settings, "majors_only", True)),
             majors_symbols=majors,
         )
-        if self.rate_breaker.cooling_down():
-            rem = self.rate_breaker.remaining_seconds()
-            self.ops.extra["rate_limit_cooldown"] = rem
-            text = text.rstrip() + f"\n⚠️ Rate-limit cooldown: {rem:.0f}s remaining"
+        parse_mode = "HTML" if (cb_resume_s > 0.5 or rl_resume_s > 0.5) else None
 
         n = len(list(status_symbols or []))
         if n > 0:
-            return status_with_symbols_button(text, symbol_count=n)
-        return TelegramReply(text=text)
+            return status_with_symbols_button(
+                text, symbol_count=n, parse_mode=parse_mode
+            )
+        return TelegramReply(text=text, parse_mode=parse_mode)
 
     def _wire_telegram_callbacks(self) -> Dict[str, Any]:
         async def status_symbols_expand(_data: str):

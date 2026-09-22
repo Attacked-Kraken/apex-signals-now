@@ -56,6 +56,13 @@ class OpsState:
         self.cb_win_since_trip = False
         self.cb_active = False
 
+    def cb_auto_resume_remaining_seconds(self) -> float:
+        """Seconds until gated CB auto-resume may fire (0 if not armed/paused)."""
+        if not self.cb_auto_resume_armed or not self.paused:
+            return 0.0
+        rem = float(self.cb_auto_resume_at or 0.0) - time.monotonic()
+        return max(0.0, rem)
+
     def cb_auto_resume_ready(self, *, regime_bull_ok: bool) -> bool:
         if not self.cb_auto_resume_armed or not self.paused:
             return False

@@ -117,7 +117,12 @@ class BanRiskTracker:
         if cooling:
             score += 15
             rem = breaker.remaining_seconds() if breaker else 0
-            reasons.append(f"currently in cooldown ({rem:.0f}s left)")
+            from trading_bot.utils.countdown import format_countdown_duration
+
+            rem_s = format_countdown_duration(rem)
+            reasons.append(
+                f"API rate-limit / 429 pause — time until trading starts again: {rem_s}"
+            )
 
         # Recovery: many successes after issues
         if n429 and n_ok > n429 * 3:

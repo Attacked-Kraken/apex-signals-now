@@ -641,3 +641,47 @@ def test_wf_best_snapshot_requires_fit_and_strictly_higher_score(tmp_path):
     settings.winning_formula = False
     higher_but_off = dict(fit, score=99, ts=14.0)
     assert not maybe_save_wf_best_snapshot(settings, higher_but_off, data_dir=tmp_path)
+
+
+def test_format_countdown_duration_shapes():
+    from trading_bot.utils.countdown import format_countdown_duration
+
+    assert format_countdown_duration(0) == "0s"
+    assert format_countdown_duration(87) == "1m 27s"
+    assert format_countdown_duration(65) == "1m 05s"
+    assert format_countdown_duration(120) == "2m"
+    assert format_countdown_duration(3665) == "1h 01m"
+
+
+def test_status_breaker_countdown_bold():
+    from trading_bot.telegram_commands import format_status_reply
+
+    text = format_status_reply(
+        paper_cash=1000.0,
+        paper_equity=1000.0,
+        positions=[],
+        paused=True,
+        strategy_mode="volume_sweet_spot",
+        last_tick_age_seconds=1.0,
+        paper=True,
+        circuit_breaker_on=True,
+        circuit_breaker_consec_losses=3,
+        circuit_breaker_resume_seconds=44 * 60 + 12,
+        rate_limit_resume_seconds=45,
+    )
+    assert "time until trading starts again" in text
+    assert "<b>44m 12s</b>" in text
+    assert "<b>45s</b>" in text
+    assert "circuit breaker pause" in text
+    assert "API rate-limit / 429 pause" in text
+
+
+def test_circuity_breaker_status_includes_countdown():
+    from trading_bot.telegram_commands import format_circuity_breaker_status
+
+    text = format_circuity_breaker_status(
+        enabled=True, consec=3, tripped=True, resume_seconds=90
+    )
+    assert "TRIPPED" in text
+    assert "time until trading starts again" in text
+    assert "<b>1m 30s</b>" in text

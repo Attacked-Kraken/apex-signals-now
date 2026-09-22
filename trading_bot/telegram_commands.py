@@ -16,6 +16,7 @@ from typing import Any, Awaitable, Callable, Dict, List, MutableMapping, Optiona
 import httpx
 
 from trading_bot.utils.entry_proximity import get_entry_threshold, make_progress_bar, progress_bar, proximity_bar
+from trading_bot.utils.countdown import format_trading_resume_countdown_line
 from trading_bot.utils.retry import with_exponential_backoff
 
 logger = logging.getLogger(__name__)
@@ -52,8 +53,14 @@ def symbols_collapse_keyboard(count: int) -> Dict[str, Any]:
     return {"inline_keyboard": [[{"text": label, "callback_data": STATUS_SYMBOLS_COLLAPSE}]]}
 
 
-def status_with_symbols_button(text: str, *, symbol_count: int) -> TelegramReply:
-    return TelegramReply(text=text, reply_markup=symbols_expand_keyboard(symbol_count))
+def status_with_symbols_button(
+    text: str, *, symbol_count: int, parse_mode: Optional[str] = None
+) -> TelegramReply:
+    return TelegramReply(
+        text=text,
+        reply_markup=symbols_expand_keyboard(symbol_count),
+        parse_mode=parse_mode,
+    )
 
 
 def _status_compact_body(message_text: str) -> str:
@@ -734,6 +741,8 @@ def execute_set_trade_profile(
     return _with_wf_broken(reply, broken)
 
 
+
+
 def format_status_reply(
     *,
     paper_cash: float,
@@ -778,6 +787,8 @@ def format_status_reply(
     quant_line: Optional[str] = None,
     circuit_breaker_on: bool = False,
     circuit_breaker_consec_losses: int = 0,
+    circuit_breaker_resume_seconds: Optional[float] = None,
+    rate_limit_resume_seconds: Optional[float] = None,
     caps_locked: bool = False,
     majors_only: Optional[bool] = None,
     majors_symbols: Optional[Sequence[str]] = None,
@@ -878,6 +889,26 @@ def format_status_reply(
         f"(⚠️☣️circuit breaker ☣️⚠️) {cb_state} · {cl} consecutive loss"
         f"{'' if cl == 1 else 'es'}"
     )
+    try:
+        cb_rem = float(circuit_breaker_resume_seconds or 0.0)
+    except (TypeError, ValueError):
+        cb_rem = 0.0
+    if cb_rem > 0.5:
+        lines.append(
+            format_trading_resume_countdown_line(
+                cb_rem, kind="circuit breaker pause"
+            )
+        )
+    try:
+        rl_rem = float(rate_limit_resume_seconds or 0.0)
+    except (TypeError, ValueError):
+        rl_rem = 0.0
+    if rl_rem > 0.5:
+        lines.append(
+            format_trading_resume_countdown_line(
+                rl_rem, kind="API rate-limit / 429 pause"
+            )
+        )
     lines.append("")
     lines.append("")
 
@@ -1415,7 +1446,13 @@ def parse_circuity_breaker_args(args: Sequence[str]) -> Optional[str]:
     return None
 
 
-def format_circuity_breaker_status(*, enabled: bool, consec: int = 0, tripped: bool = False) -> str:
+def format_circuity_breaker_status(
+    *,
+    enabled: bool,
+    consec: int = 0,
+    tripped: bool = False,
+    resume_seconds: Optional[float] = None,
+) -> str:
     state = "ON" if enabled else "OFF"
     bits = [
         f"circuity_breaker_manually: {state}",
@@ -1427,7 +1464,16 @@ def format_circuity_breaker_status(*, enabled: bool, consec: int = 0, tripped: b
         bits.append("losses still counted — no auto pause; /resume if paused")
     if tripped:
         bits.append("TRIPPED (paused) — /resume to trade")
-    return " · ".join(bits)
+    try:
+        rem = float(resume_seconds or 0.0)
+    except (TypeError, ValueError):
+        rem = 0.0
+    body = " · ".join(bits)
+    if rem > 0.5:
+        body = body + "\n" + format_trading_resume_countdown_line(
+            rem, kind="circuit breaker pause"
+        )
+    return body
 
 
 def execute_set_circuity_breaker(

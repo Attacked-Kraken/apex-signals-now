@@ -42,7 +42,7 @@ class RiskManager:
                 self._pause_cb(True)
             msg = (
                 f"⚠️ CIRCUIT BREAKER: {limit} consecutive losses — new buys paused. "
-                "Use /resume"
+                "Time until trading starts again: ~45m (or /resume sooner)."
             )
             logger.warning(msg)
             if self._notify_cb:
