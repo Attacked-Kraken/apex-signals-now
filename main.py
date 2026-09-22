@@ -71,6 +71,8 @@ from trading_bot.telegram_commands import (
     execute_set_stop_loss,
     execute_set_trade_profile,
     execute_set_winning_formula,
+    maybe_save_wf_best_snapshot,
+    note_wf_broken,
     format_balance_reply,
     format_circuity_breaker_status,
     format_history_reply,
@@ -87,10 +89,6 @@ from trading_bot.telegram_commands import (
     format_wipe_paper_pending_reply,
     normalize_symbol_mode,
     parse_circuity_breaker_args,
-    parse_majors_args,
-    format_majors_status,
-    execute_set_majors,
-    MAJORS_USAGE,
     PHD_USAGE,
     parse_phd_args,
     format_phd_status_line,
@@ -252,7 +250,12 @@ class TradingApp:
 
     def _enforce_winning_formula_sl(self) -> None:
         if self.settings.winning_formula:
-            execute_set_stop_loss(self.settings, "medium", env_path=ENV_PATH if ENV_PATH.exists() else None)
+            execute_set_stop_loss(
+                self.settings,
+                "medium",
+                env_path=ENV_PATH if ENV_PATH.exists() else None,
+                break_wf=False,
+            )
 
     # --- regime / thresholds / brackets ---
 
@@ -813,6 +816,9 @@ class TradingApp:
             if len(args) < 2:
                 return "Usage: /set_limit <trade> <book>"
             trade, book = float(args[0]), float(args[1])
+            broken = note_wf_broken(
+                self.settings, "size_caps", ENV_PATH if ENV_PATH.exists() else None
+            )
             object.__setattr__(self.settings, "max_notional_per_trade_usd", trade)
             object.__setattr__(self.settings, "max_total_exposure_usd", book)
             object.__setattr__(self.settings, "caps_custom_lock", True)
@@ -826,7 +832,8 @@ class TradingApp:
                         "CAPS_CUSTOM_LOCK": "true",
                     },
                 )
-            return f"caps → ${trade:.0f}/trade ${book:.0f} exposure 🔒"
+            reply = f"caps → ${trade:.0f}/trade ${book:.0f} exposure 🔒"
+            return f"{reply}\n{broken}" if broken else reply
 
         async def set_threshold(_c: str, args: List[str]) -> str:
             if not args:
@@ -836,10 +843,14 @@ class TradingApp:
                 return "Threshold must be 15–95"
             from trading_bot.telegram_commands import apply_runtime_entry_threshold, _persist_env
 
+            broken = note_wf_broken(
+                self.settings, "entry_threshold", ENV_PATH if ENV_PATH.exists() else None
+            )
             apply_runtime_entry_threshold(self.settings, v)
             if ENV_PATH.exists():
                 _persist_env(ENV_PATH, {"ENTRY_THRESHOLD": str(v)})
-            return f"Threshold → {v:.0f}%"
+            reply = f"Threshold → {v:.0f}%"
+            return f"{reply}\n{broken}" if broken else reply
 
         async def set_threshold_custom(_c: str, args: List[str]) -> str:
             reply = await set_threshold(_c, args)
@@ -847,7 +858,7 @@ class TradingApp:
             if ENV_PATH.exists():
                 from trading_bot.telegram_commands import _persist_env
                 _persist_env(ENV_PATH, {"ENTRY_THRESHOLD_CUSTOM_LOCK": "true"})
-            return reply + " (custom lock)"
+            return reply + "\ncustom lock: ON"
 
         async def set_spread(_c: str, args: List[str]) -> str:
             if not args:
@@ -866,6 +877,9 @@ class TradingApp:
             if not args:
                 return f"tod_custom={'ON' if self.settings.tod_gate_enabled else 'OFF'}"
             on = args[0].lower() in ("on", "1", "true")
+            broken = note_wf_broken(
+                self.settings, "tod_custom", ENV_PATH if ENV_PATH.exists() else None
+            )
             object.__setattr__(self.settings, "tod_gate_enabled", on)
             object.__setattr__(self.settings, "disable_tod_gate", not on)
             object.__setattr__(self.settings, "tod_custom_lock", True)
@@ -879,7 +893,8 @@ class TradingApp:
                         "TOD_CUSTOM_LOCK": "true",
                     },
                 )
-            return f"tod_custom → {'ON' if on else 'OFF'} 🔒"
+            reply = f"tod_custom → {'ON' if on else 'OFF'} 🔒"
+            return f"{reply}\n{broken}" if broken else reply
 
         async def stop_loss(_c: str, args: List[str]) -> str:
             if not args:
@@ -1264,22 +1279,6 @@ class TradingApp:
             q = self._quant_snapshot(bal, formula_band=band)
             return format_quant_report(q)
 
-        async def majors(_c: str, args: List[str]) -> str:
-            action = parse_majors_args(args)
-            if action is None:
-                return MAJORS_USAGE
-            maj_list = [s for s in MAJORS_ONLY_DEFAULT if s in self.settings.symbol_list()] or list(MAJORS_ONLY_DEFAULT)
-            enabled = bool(getattr(self.settings, "majors_only", True))
-            if action == "status":
-                return format_majors_status(enabled=enabled, symbols=maj_list)
-            on = action == "on"
-            return execute_set_majors(
-                self.settings,
-                on,
-                env_path=ENV_PATH if ENV_PATH.exists() else None,
-                majors_symbols=maj_list,
-            )
-
         async def circuity_breaker_manually(_c: str, args: List[str]) -> str:
             action = parse_circuity_breaker_args(args)
             if action is None:
@@ -1348,8 +1347,6 @@ class TradingApp:
             "set_threshold_custom": set_threshold_custom,
             "set_spread": set_spread,
             "tod_custom": tod_custom,
-            "majors": majors,
-            "major": majors,
             "ban_risk": ban_risk,
             "api_risk": ban_risk,
             "formula": formula,
@@ -1465,6 +1462,14 @@ class TradingApp:
         _formula_bal = dict(bal)
         _formula_bal["positions_count"] = len(pos_rows)
         _formula = self._evaluate_formula_snap(_formula_bal)
+        try:
+            maybe_save_wf_best_snapshot(
+                self.settings,
+                _formula,
+                env_path=ENV_PATH if ENV_PATH.exists() else None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("winning_formula snapshot save failed: %s", exc)
         quant_line = None
         if bool(getattr(self.settings, "quant_metrics_on_status", True)):
             try:

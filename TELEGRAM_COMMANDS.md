@@ -76,6 +76,12 @@ are vs the production `tg_i2.py` dump for Instance #2.
 
 ## Operator notes (behaviors)
 
+### `/winning_formula [on|off|status]`
+- ON applies the single Tier-1 pack: threshold/position limits, medium SL, fee + HWM/trail knobs, circuit breaker, caps/profile, and majors-only BTC/ETH/SOL/LINK/XCN.
+- Changing a trading knob while ON immediately persists `WINNING_FORMULA=false` and reports which knob left the pack; it does not roll back that change.
+- ON restores `data/wf_last_snapshot.json`; fit, strictly higher formula health observed by `/status` is saved to `data/wf_best_snapshot.json` and the last-ON snapshot without applying mid-session.
+- Majors-only remains an internal WF/PHD setting and is not independently operator-toggleable.
+
 ### `/circuity_breaker_manually [on|off|status]`
 - Bare / `status` → current ON/OFF, consecutive losses, trip hint.
 - `on` / `off` → persists `CIRCUIT_BREAKER_ENABLED` to `.env` + runtime settings / `ops.cb_enabled`.

@@ -498,3 +498,146 @@ def test_format_status_symbols_tap_line_and_fields():
     reply = status_with_symbols_button(text, symbol_count=4)
     assert "▼ Symbols (4)" in reply.reply_markup["inline_keyboard"][0][0]["text"]
 
+
+
+def test_wf_registry_has_no_major_commands():
+    names = {name for name, _description in BOT_COMMAND_SPECS}
+    assert "major" not in names
+    assert "majors" not in names
+
+
+def _wf_settings(**overrides):
+    values = {
+        "entry_threshold": 40.0,
+        "max_concurrent_positions": 2,
+        "min_tp_pct": 0.02,
+        "atr_bracket_tp_min_pct": 0.02,
+        "trail_fee_buffer_pct": 0.01,
+        "elite_fee_lock_arm_pct": 0.01,
+        "tp1_fraction": 0.5,
+        "stop_loss_profile": "tight",
+        "taker_fee_rate": 0.01,
+        "maker_fee_rate": 0.01,
+        "circuit_breaker_enabled": False,
+        "majors_only": False,
+        "max_spread_pct": 0.004,
+        "trade_profile": "aggressive",
+        "max_notional_per_trade_usd": 500.0,
+        "max_total_exposure_usd": 2000.0,
+        "winning_formula": False,
+        "sl_min_pct": 0.0075,
+        "sl_max_pct": 0.0075,
+        "elite_atr_sl_mult": 1.0,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_wf_on_sets_majors_and_restores_last_snapshot(tmp_path):
+    import json
+    from trading_bot.telegram_commands import execute_set_winning_formula
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("WINNING_FORMULA=false\nMAJORS_ONLY=false\n")
+    data = tmp_path / "data"
+    data.mkdir()
+    snapshot = {
+        "entry_threshold": 71.0,
+        "max_concurrent_positions": 4,
+        "min_tp_pct": 0.031,
+        "trail_fee_buffer_pct": 0.013,
+        "elite_fee_lock_arm_pct": 0.014,
+        "tp1_fraction": 0.0,
+        "stop_loss_profile": "medium",
+        "taker_fee_rate": 0.008,
+        "maker_fee_rate": 0.004,
+        "circuit_breaker_enabled": True,
+        "majors_only": False,
+        "max_spread_pct": 0.0019,
+        "trade_profile": "medium",
+        "max_notional_per_trade_usd": 625.0,
+        "max_total_exposure_usd": 2500.0,
+        "score": 82,
+        "n_trades": 9,
+        "expectancy": 3.5,
+        "ts": 1234.0,
+    }
+    (data / "wf_last_snapshot.json").write_text(json.dumps(snapshot))
+    settings = _wf_settings()
+
+    reply = execute_set_winning_formula(settings, enabled=True, env_path=env_path, environ={})
+
+    assert settings.winning_formula is True
+    assert settings.majors_only is True
+    assert settings.entry_threshold == 71.0
+    assert settings.max_notional_per_trade_usd == 625.0
+    assert settings.min_tp_pct == 0.031
+    assert "winning_formula: ON 🚀" in reply
+    assert "BTC/ETH/SOL/LINK/XCN" in reply
+    env_text = env_path.read_text()
+    assert "WINNING_FORMULA=true" in env_text
+    assert "MAJORS_ONLY=true" in env_text
+
+
+@pytest.mark.asyncio
+async def test_changing_threshold_turns_wf_off_without_rollback(tmp_path, monkeypatch):
+    import main
+    from trading_bot.config import Settings
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("WINNING_FORMULA=true\nENTRY_THRESHOLD=60\n")
+    monkeypatch.setattr(main, "ENV_PATH", env_path)
+    settings = Settings(winning_formula=True, entry_threshold=60, _env_file=None)
+    app = main.TradingApp(settings)
+    try:
+        reply = await app._wire_telegram_commands()["set_threshold"](
+            "set_threshold", ["72"]
+        )
+        assert settings.entry_threshold == 72.0
+        assert settings.winning_formula is False
+        assert "winning_formula: OFF (knob changed: entry_threshold)" in reply
+        assert "WINNING_FORMULA=false" in env_path.read_text()
+    finally:
+        await app.shutdown()
+
+
+def test_wf_best_snapshot_requires_fit_and_strictly_higher_score(tmp_path):
+    import json
+    from trading_bot.telegram_commands import WF_SNAPSHOT_FIELDS, maybe_save_wf_best_snapshot
+
+    settings = _wf_settings(winning_formula=True, majors_only=True)
+    weak = {
+        "score": 90,
+        "band": "WEAK",
+        "metrics": {"closed_trades_n": 8, "expectancy": 5.0},
+        "ts": 10.0,
+    }
+    assert not maybe_save_wf_best_snapshot(settings, weak, data_dir=tmp_path)
+    assert not (tmp_path / "wf_best_snapshot.json").exists()
+
+    too_few = {
+        "score": 70,
+        "band": "OK",
+        "metrics": {"closed_trades_n": 2, "expectancy": 5.0},
+        "ts": 11.0,
+    }
+    assert not maybe_save_wf_best_snapshot(settings, too_few, data_dir=tmp_path)
+
+    fit = {
+        "score": 71,
+        "band": "STRONG",
+        "metrics": {"closed_trades_n": 3, "expectancy": 1.25},
+        "ts": 12.0,
+    }
+    assert maybe_save_wf_best_snapshot(settings, fit, data_dir=tmp_path)
+    best = json.loads((tmp_path / "wf_best_snapshot.json").read_text())
+    assert set(best) == set(WF_SNAPSHOT_FIELDS)
+    assert best["score"] == 71
+    assert best["n_trades"] == 3
+    assert (tmp_path / "wf_last_snapshot.json").exists()
+
+    same_score = dict(fit, ts=13.0)
+    assert not maybe_save_wf_best_snapshot(settings, same_score, data_dir=tmp_path)
+    settings.winning_formula = False
+    higher_but_off = dict(fit, score=99, ts=14.0)
+    assert not maybe_save_wf_best_snapshot(settings, higher_but_off, data_dir=tmp_path)

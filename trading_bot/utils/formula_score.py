@@ -439,6 +439,7 @@ def evaluate_formula(
         "paper_equity": eq,
         "starting_equity": start,
         "expectancy": exp_info.get("expectancy"),
+        "closed_trades_n": int(exp_info.get("n") or 0),
         "avg_win": exp_info.get("avg_win"),
         "avg_loss": exp_info.get("avg_loss"),
     }
@@ -567,6 +568,7 @@ def _snapshot_for_memory(snap: Dict[str, Any]) -> Dict[str, Any]:
         "positions_count": m.get("positions_count"),
         "paper_equity": m.get("paper_equity"),
         "expectancy": m.get("expectancy"),
+        "closed_trades_n": m.get("closed_trades_n"),
     }
     top3 = list(snap.get("adjustments") or [])[:3]
     return {

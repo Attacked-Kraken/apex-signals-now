@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import json
 import logging
 import os
 import time
@@ -95,7 +96,6 @@ BOT_COMMAND_SPECS: List[Tuple[str, str]] = [
     ("grok", "Grok sentiment"),
     ("regime", "Market regime"),
     ("logs", "Tail paper log"),
-    ("majors", "Majors-only scan on/off/status"),
     ("ban_risk", "API ban-risk hygiene score"),
     ("api_risk", "Alias for /ban_risk"),
     ("formula", "Formula health score + tips"),
@@ -104,7 +104,6 @@ BOT_COMMAND_SPECS: List[Tuple[str, str]] = [
     ("phd_mode", "Alias for /phd"),
     ("quant", "Session risk metrics + DD gate"),
     ("quant_metrics", "Alias for /quant"),
-    ("major", "Alias for /majors"),
     ("universe", "Crypto universe mode"),
     ("universe_all", "Kraken discovery"),
     ("universe_stocks", "Toggle xStocks"),
@@ -197,7 +196,70 @@ _WF_SAVED_KEYS = (
     "taker_fee_rate",
     "maker_fee_rate",
     "circuit_breaker_enabled",
+    "majors_only",
+    "max_spread_pct",
+    "trade_profile",
+    "max_notional_per_trade_usd",
+    "max_total_exposure_usd",
 )
+
+WF_SNAPSHOT_FIELDS = (
+    "entry_threshold",
+    "max_concurrent_positions",
+    "min_tp_pct",
+    "trail_fee_buffer_pct",
+    "elite_fee_lock_arm_pct",
+    "tp1_fraction",
+    "stop_loss_profile",
+    "taker_fee_rate",
+    "maker_fee_rate",
+    "circuit_breaker_enabled",
+    "majors_only",
+    "max_spread_pct",
+    "trade_profile",
+    "max_notional_per_trade_usd",
+    "max_total_exposure_usd",
+    "score",
+    "n_trades",
+    "expectancy",
+    "ts",
+)
+
+_WF_TIER1_DEFAULTS: Dict[str, Any] = {
+    "entry_threshold": 60.0,
+    "max_concurrent_positions": 3,
+    "min_tp_pct": 0.0305,
+    "trail_fee_buffer_pct": 0.0125,
+    "elite_fee_lock_arm_pct": 0.012,
+    "tp1_fraction": 0.0,
+    "stop_loss_profile": "medium",
+    "taker_fee_rate": 0.008,
+    "maker_fee_rate": 0.004,
+    "circuit_breaker_enabled": True,
+    "majors_only": True,
+    "max_spread_pct": 0.002,
+    "trade_profile": "medium",
+    "max_notional_per_trade_usd": 750.0,
+    "max_total_exposure_usd": 3000.0,
+}
+
+_WF_ENV_KEYS = {
+    "entry_threshold": "ENTRY_THRESHOLD",
+    "max_concurrent_positions": "MAX_CONCURRENT_POSITIONS",
+    "min_tp_pct": "MIN_TP_PCT",
+    "trail_fee_buffer_pct": "TRAIL_FEE_BUFFER_PCT",
+    "elite_fee_lock_arm_pct": "ELITE_FEE_LOCK_ARM_PCT",
+    "tp1_fraction": "TP1_FRACTION",
+    "stop_loss_profile": "STOP_LOSS_PROFILE",
+    "taker_fee_rate": "TAKER_FEE_RATE",
+    "maker_fee_rate": "MAKER_FEE_RATE",
+    "circuit_breaker_enabled": "CIRCUIT_BREAKER_ENABLED",
+    "majors_only": "MAJORS_ONLY",
+    "max_spread_pct": "MAX_SPREAD_PCT",
+    "trade_profile": "TRADE_PROFILE",
+    "max_notional_per_trade_usd": "MAX_NOTIONAL_PER_TRADE_USD",
+    "max_total_exposure_usd": "MAX_TOTAL_EXPOSURE_USD",
+}
 
 
 def _persist_env(env_path: Path, updates: Dict[str, str]) -> None:
@@ -218,6 +280,123 @@ def _persist_env(env_path: Path, updates: Dict[str, str]) -> None:
         if k not in keys_done:
             out.append(f"{k}={v}")
     env_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def _wf_snapshot_paths(
+    *, env_path: Optional[Path] = None, data_dir: Optional[Path] = None
+) -> Tuple[Path, Path]:
+    if data_dir is not None:
+        root = Path(data_dir)
+    elif env_path is not None:
+        root = Path(env_path).resolve().parent / "data"
+    else:
+        root = Path(__file__).resolve().parents[1] / "data"
+    return root / "wf_best_snapshot.json", root / "wf_last_snapshot.json"
+
+
+def _load_json_dict(path: Path) -> Dict[str, Any]:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _wf_snapshot_from_settings(
+    settings: Any,
+    *,
+    score: Any = 0,
+    n_trades: Any = 0,
+    expectancy: Any = 0.0,
+    ts: Any = None,
+) -> Dict[str, Any]:
+    values = dict(_WF_TIER1_DEFAULTS)
+    for key in _WF_TIER1_DEFAULTS:
+        value = getattr(settings, key, None)
+        if value is not None:
+            values[key] = value
+    values.update(
+        {
+            "score": int(score or 0),
+            "n_trades": int(n_trades or 0),
+            "expectancy": float(expectancy or 0.0),
+            "ts": float(ts or time.time()),
+        }
+    )
+    return {key: values[key] for key in WF_SNAPSHOT_FIELDS}
+
+
+def maybe_save_wf_best_snapshot(
+    settings: Any,
+    formula_snap: Dict[str, Any],
+    *,
+    env_path: Optional[Path] = None,
+    data_dir: Optional[Path] = None,
+) -> bool:
+    """Save a strictly better, fit WF pack; never auto-apply it."""
+    if not bool(getattr(settings, "winning_formula", False)):
+        return False
+    band = str(formula_snap.get("band") or "").upper()
+    metrics = formula_snap.get("metrics") or {}
+    try:
+        score = int(formula_snap.get("score") or 0)
+        n_trades = int(metrics.get("closed_trades_n") or 0)
+        expectancy = float(metrics.get("expectancy") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if band == "WEAK" or not (n_trades >= 5 or (n_trades >= 3 and expectancy > 0)):
+        return False
+    best_path, last_path = _wf_snapshot_paths(env_path=env_path, data_dir=data_dir)
+    prior = _load_json_dict(best_path)
+    try:
+        prior_score = int(prior.get("score", -1))
+    except (TypeError, ValueError):
+        prior_score = -1
+    if score <= prior_score:
+        return False
+    payload = _wf_snapshot_from_settings(
+        settings,
+        score=score,
+        n_trades=n_trades,
+        expectancy=expectancy,
+        ts=formula_snap.get("ts"),
+    )
+    _write_json_atomic(best_path, payload)
+    _write_json_atomic(last_path, payload)
+    logger.info("winning_formula: saved fit best snapshot score=%d n=%d", score, n_trades)
+    return True
+
+
+def note_wf_broken(
+    settings: Any,
+    reason: str,
+    env_path: Optional[Path] = None,
+    *,
+    environ: Optional[MutableMapping[str, str]] = None,
+) -> str:
+    """Mark WF off after a knob change without restoring any prior knobs."""
+    if not bool(getattr(settings, "winning_formula", False)):
+        return ""
+    object.__setattr__(settings, "winning_formula", False)
+    env = os.environ if environ is None else environ
+    env[ENV_KEY_WINNING_FORMULA] = "false"
+    if env_path is not None:
+        _persist_env(Path(env_path), {ENV_KEY_WINNING_FORMULA: "false"})
+    message = f"winning_formula: OFF (knob changed: {reason})"
+    logger.warning(message)
+    return message
+
+
+def _with_wf_broken(reply: str, broken: str) -> str:
+    return f"{reply}\n{broken}" if broken else reply
 
 
 def apply_runtime_entry_threshold(settings: Any, value: float) -> None:
@@ -326,12 +505,13 @@ def execute_set_spread(
     pct = parse_set_max_spread_alias(args) if from_alias else parse_set_spread_args(args)
     frac = float(pct) / 100.0
     frac_s = f"{frac:.10f}".rstrip("0").rstrip(".")
+    broken = note_wf_broken(settings, "max_spread_pct", env_path, environ=environ)
     apply_runtime_max_spread_pct(settings, frac)
     env_map = os.environ if environ is None else environ
     env_map["MAX_SPREAD_PCT"] = frac_s
     if env_path:
         _persist_env(Path(env_path), {"MAX_SPREAD_PCT": frac_s})
-    return format_set_spread_reply(pct)
+    return _with_wf_broken(format_set_spread_reply(pct), broken)
 
 
 
@@ -341,6 +521,7 @@ def execute_set_stop_loss(
     *,
     env_path: Optional[Path] = None,
     signal_engine: Any = None,
+    break_wf: bool = True,
 ) -> str:
     key = profile.strip().lower()
     aliases = {
@@ -357,6 +538,7 @@ def execute_set_stop_loss(
     key = aliases.get(key, key)
     if key not in STOP_LOSS_PRESETS:
         return f"Unknown stop_loss profile: {profile}. Use tight|medium|free"
+    broken = note_wf_broken(settings, "stop_loss", env_path) if break_wf else ""
     preset = STOP_LOSS_PRESETS[key]
     object.__setattr__(settings, "stop_loss_profile", key)
     object.__setattr__(settings, "sl_min_pct", preset["sl_min_pct"])
@@ -377,11 +559,12 @@ def execute_set_stop_loss(
         _persist_env(env_path, updates)
     if signal_engine is not None and hasattr(signal_engine, "on_stop_loss_change"):
         signal_engine.on_stop_loss_change(key, preset)
-    return (
+    reply = (
         f"{preset['emoji']} stop_loss → {preset['label']} "
         f"−{preset['sl_pct']*100:.2f}% / TP +{preset['tp_pct']*100:.2f}% "
         f"({preset['note']})"
     )
+    return _with_wf_broken(reply, broken)
 
 
 
@@ -421,13 +604,23 @@ def format_winning_formula_status_line(*, enabled: bool) -> str:
 
 def format_winning_formula_activated() -> str:
     return (
+        "winning_formula: ON 🚀\n"
         "🚀 WINNING FORMULA ACTIVATED\n"
-        "• SL → 🟡 MEDIUM −1.50% / TP ~+2.25% (BEAR clamp −1.25% / ≤$6@$500)\n"
+        "• Majors only: BTC/ETH/SOL/LINK/XCN\n"
+        "• SL → 🟡 MEDIUM −1.50% / WF TP floor +3.05% (BEAR clamp −1.25% / ≤$6@$500)\n"
         "• Threshold 65% BEAR / 60% BULL · max 1 pos in BEAR\n"
         "• Tier-1 fees 0.80%/0.40% · HWM peak +1.20% → SL +1.25%\n"
         "• Time-exit maker ≥+1.25% · full exits (no partials)\n"
         "• Circuit: 3 consec losses · 45m gated auto-resume"
     )
+
+
+def _wf_env_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float) and value.is_integer():
+        return f"{value:g}"
+    return str(value)
 
 
 def execute_set_winning_formula(
@@ -439,57 +632,66 @@ def execute_set_winning_formula(
     signal_engine: Any = None,
 ) -> str:
     env = environ if environ is not None else os.environ
-    updates: Dict[str, str] = {ENV_KEY_WINNING_FORMULA: "true" if enabled else "false"}
     if enabled:
-        saved = {k: getattr(settings, k, None) for k in _WF_SAVED_KEYS}
-        object.__setattr__(settings, "_winning_formula_saved", saved)
-        # Tier-1 best stack (Sep 2026): BULL base 60 / BEAR floor 65 at runtime
-        object.__setattr__(settings, "entry_threshold", 60.0)
-        apply_runtime_entry_threshold(settings, 60.0)
-        env["ENTRY_THRESHOLD"] = "60"  # beat shell leftovers
-        object.__setattr__(settings, "max_concurrent_positions", 3)  # BEAR cap → 1 live
-        object.__setattr__(settings, "min_tp_pct", 0.0305)
-        object.__setattr__(settings, "atr_bracket_tp_min_pct", 0.0305)
-        object.__setattr__(settings, "trail_fee_buffer_pct", 0.0125)  # +1.25% floor
-        object.__setattr__(settings, "elite_fee_lock_arm_pct", 0.012)  # arm at RT +1.20%
-        object.__setattr__(settings, "tp1_fraction", 0.0)
-        object.__setattr__(settings, "taker_fee_rate", 0.008)
-        object.__setattr__(settings, "maker_fee_rate", 0.004)
-        try:
-            object.__setattr__(settings, "circuit_breaker_enabled", True)
-        except Exception:
-            pass
-        execute_set_stop_loss(settings, "medium", env_path=env_path, signal_engine=signal_engine)
-        updates.update(
-            {
-                "ENTRY_THRESHOLD": "60",
-                "MAX_CONCURRENT_POSITIONS": "3",
-                "MIN_TP_PCT": "0.0305",
-                "TRAIL_FEE_BUFFER_PCT": "0.0125",
-                "ELITE_FEE_LOCK_ARM_PCT": "0.012",
-                "TP1_FRACTION": "0",
-                "TAKER_FEE_RATE": "0.008",
-                "MAKER_FEE_RATE": "0.004",
-                "CIRCUIT_BREAKER_ENABLED": "true",
-            }
+        if not bool(getattr(settings, "winning_formula", False)):
+            saved = {k: getattr(settings, k, None) for k in _WF_SAVED_KEYS}
+            object.__setattr__(settings, "_winning_formula_saved", saved)
+
+        _best_path, last_path = _wf_snapshot_paths(env_path=env_path)
+        prior = _load_json_dict(last_path)
+        pack = dict(_WF_TIER1_DEFAULTS)
+        for key in _WF_TIER1_DEFAULTS:
+            if prior.get(key) is not None:
+                pack[key] = prior[key]
+        # These are invariant parts of the current Winning Formula setup.
+        pack["majors_only"] = True
+        pack["circuit_breaker_enabled"] = True
+        pack["stop_loss_profile"] = "medium"
+
+        execute_set_stop_loss(
+            settings,
+            "medium",
+            env_path=env_path,
+            signal_engine=signal_engine,
+            break_wf=False,
         )
+        for key, value in pack.items():
+            object.__setattr__(settings, key, value)
+        object.__setattr__(settings, "atr_bracket_tp_min_pct", float(pack["min_tp_pct"]))
+        apply_runtime_entry_threshold(settings, float(pack["entry_threshold"]))
         object.__setattr__(settings, "winning_formula", True)
+
+        updates: Dict[str, str] = {ENV_KEY_WINNING_FORMULA: "true"}
+        for key, env_key in _WF_ENV_KEYS.items():
+            updates[env_key] = _wf_env_value(pack[key])
+        updates["ATR_BRACKET_TP_MIN_PCT"] = _wf_env_value(pack["min_tp_pct"])
+        env.update(updates)
         if env_path:
-            _persist_env(env_path, updates)
+            _persist_env(Path(env_path), updates)
+
+        last_payload = _wf_snapshot_from_settings(
+            settings,
+            score=prior.get("score", 0),
+            n_trades=prior.get("n_trades", 0),
+            expectancy=prior.get("expectancy", 0.0),
+            ts=prior.get("ts"),
+        )
+        _write_json_atomic(last_path, last_payload)
         return format_winning_formula_activated()
 
-    # restore
+    # Explicit OFF may restore the pre-ON scratch. Auto-off uses note_wf_broken
+    # instead and intentionally leaves all changed knobs in place.
     saved = getattr(settings, "_winning_formula_saved", None) or {}
-    for k, v in saved.items():
-        if v is not None:
-            object.__setattr__(settings, k, v)
-            if k == "entry_threshold":
-                apply_runtime_entry_threshold(settings, float(v))
+    for key, value in saved.items():
+        if value is not None:
+            object.__setattr__(settings, key, value)
+            if key == "entry_threshold":
+                apply_runtime_entry_threshold(settings, float(value))
     object.__setattr__(settings, "winning_formula", False)
+    env[ENV_KEY_WINNING_FORMULA] = "false"
     if env_path:
-        _persist_env(env_path, updates)
+        _persist_env(Path(env_path), {ENV_KEY_WINNING_FORMULA: "false"})
     return "Winning Formula OFF — prior knobs restored where available."
-
 
 def execute_set_trade_profile(
     settings: Any,
@@ -501,6 +703,7 @@ def execute_set_trade_profile(
     if key not in TRADE_PROFILE_PRESETS:
         return f"Unknown profile: {name}. Use aggressive|medium|low"
     preset = TRADE_PROFILE_PRESETS[key]
+    broken = note_wf_broken(settings, "trade_profile", env_path)
     # clears WF + custom locks
     object.__setattr__(settings, "winning_formula", False)
     object.__setattr__(settings, "tod_custom_lock", False)
@@ -525,7 +728,8 @@ def execute_set_trade_profile(
     }
     if env_path:
         _persist_env(env_path, updates)
-    return f"Profile → {key.upper()} (WF cleared). Threshold {preset['entry_threshold']:.0f}%"
+    reply = f"Profile → {key.upper()}. Threshold {preset['entry_threshold']:.0f}%"
+    return _with_wf_broken(reply, broken)
 
 
 def format_status_reply(
@@ -1150,7 +1354,11 @@ def execute_set_phd_mode(
         object.__setattr__(settings, "trade_profile", "medium")
         env["TRADE_PROFILE"] = "medium"
         execute_set_stop_loss(
-            settings, "medium", env_path=env_path, signal_engine=signal_engine
+            settings,
+            "medium",
+            env_path=env_path,
+            signal_engine=signal_engine,
+            break_wf=False,
         )
         execute_set_circuity_breaker(
             settings,
@@ -1160,6 +1368,7 @@ def execute_set_phd_mode(
             ops=ops,
             consec=0,
             tripped=False,
+            break_wf=False,
         )
         execute_set_majors(
             settings,
@@ -1228,9 +1437,15 @@ def execute_set_circuity_breaker(
     ops: Any = None,
     consec: int = 0,
     tripped: bool = False,
+    break_wf: bool = True,
 ) -> str:
     """Persist CIRCUIT_BREAKER_ENABLED; losses always counted; auto-pause follows flag."""
     env = environ if environ is not None else os.environ
+    broken = (
+        note_wf_broken(settings, "circuit_breaker_enabled", env_path, environ=env)
+        if break_wf
+        else ""
+    )
     flag = bool(enabled)
     try:
         object.__setattr__(settings, "circuit_breaker_enabled", flag)
@@ -1247,7 +1462,10 @@ def execute_set_circuity_breaker(
                 ops.cb_active = False
         except Exception:  # noqa: BLE001
             pass
-    return format_circuity_breaker_status(enabled=flag, consec=int(consec or 0), tripped=bool(tripped) and flag)
+    reply = format_circuity_breaker_status(
+        enabled=flag, consec=int(consec or 0), tripped=bool(tripped) and flag
+    )
+    return _with_wf_broken(reply, broken)
 
 
 # ---------------------------------------------------------------------------

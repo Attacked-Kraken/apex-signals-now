@@ -84,7 +84,7 @@ def test_fee_lock():
     assert new_sl == floor
 
 
-def test_winning_formula_and_presets():
+def test_winning_formula_and_presets(tmp_path):
     from trading_bot.config import Settings
     from trading_bot.telegram_commands import (
         STOP_LOSS_PRESETS,
@@ -97,7 +97,9 @@ def test_winning_formula_and_presets():
     assert TRADE_PROFILE_PRESETS["aggressive"]["max_total_exposure_usd"] == 3000
 
     s = Settings(winning_formula=False, entry_threshold=65, _env_file=None)
-    msg = execute_set_winning_formula(s, enabled=True, env_path=None)
+    env_path = tmp_path / ".env"
+    env_path.write_text("WINNING_FORMULA=false\n")
+    msg = execute_set_winning_formula(s, enabled=True, env_path=env_path)
     assert "WINNING FORMULA ACTIVATED" in msg
     assert s.winning_formula is True
     assert s.entry_threshold == 60.0
